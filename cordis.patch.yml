@@ -1,0 +1,5 @@
+# Evidence Arena is one dual-face package: this row mounts the Host RPC
+# controller; dsh.client metadata exposes the stock-slot workbench.
+- insert:
+    - id: arena
+      name: 'dsh-evidence-arena'

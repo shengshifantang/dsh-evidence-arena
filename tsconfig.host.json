@@ -1,0 +1,25 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib/types",
+    "types": ["node"]
+  },
+  "files": [
+    "src/budget.ts",
+    "src/context-cache.ts",
+    "src/diff-artifact.ts",
+    "src/index.ts",
+    "src/config.ts",
+    "src/git.ts",
+    "src/invariant.ts",
+    "src/policy.ts",
+    "src/process-runner.ts",
+    "src/repository-path.ts",
+    "src/runtime.ts",
+    "src/security.ts",
+    "src/service.ts",
+    "src/store.ts",
+    "src/types.ts"
+  ]
+}

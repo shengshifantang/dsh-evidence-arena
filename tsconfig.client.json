@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib/types",
+    "jsx": "react-jsx",
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "types": []
+  },
+  "files": [
+    "src/client/index.ts",
+    "src/client/ArenaCard.tsx",
+    "src/client/ArenaDiffReview.tsx",
+    "src/client/ArenaLauncher.tsx",
+    "src/client/ArenaWorkbench.tsx",
+    "src/client/locales.ts",
+    "src/client/rpc.ts",
+    "src/client/stores.ts",
+    "src/css-modules.d.ts",
+    "src/types.ts"
+  ]
+}
