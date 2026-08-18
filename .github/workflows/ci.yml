@@ -48,6 +48,8 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+      - name: Expose isolated pnpm global bin
+        run: echo "$PNPM_HOME/bin" >> "$GITHUB_PATH"
       - run: pnpm install --frozen-lockfile
       - run: mkdir -p "$RUNNER_TEMP/arena-pack"
       - run: pnpm pack --pack-destination "$RUNNER_TEMP/arena-pack"
