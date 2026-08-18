@@ -12,6 +12,7 @@ import type { ConfinedArgv, SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import { Config, resolveConfig, type ResolvedConfig } from '../src/config.ts'
 import { initialRunBudget } from '../src/budget.ts'
+import { portableUntrackedMode } from '../src/git.ts'
 import { resolveArenaPolicy } from '../src/policy.ts'
 import { ManagedProcessRunner } from '../src/process-runner.ts'
 import type { ArenaRuntimeResult, ArenaRuntimeRunner, ArenaRuntimeSpec } from '../src/runtime.ts'
@@ -39,11 +40,12 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return result.stdout
 }
 
-async function repository(label: string): Promise<string> {
+async function repository(label: string, autoCrlf = false): Promise<string> {
   const root = await temporaryDirectory(label)
   await git(root, 'init', '--quiet')
   await git(root, 'config', 'user.name', 'Arena Test')
   await git(root, 'config', 'user.email', 'arena@example.invalid')
+  if (autoCrlf) await git(root, 'config', 'core.autocrlf', 'true')
   await writeFile(join(root, 'app.txt'), 'base\n')
   await git(root, 'add', 'app.txt')
   await git(root, 'commit', '--quiet', '-m', 'base')
@@ -286,6 +288,53 @@ class ReviewingRuntime implements ArenaRuntimeRunner {
   }
 }
 
+class ExhaustedThenJsonRuntime implements ArenaRuntimeRunner {
+  readonly reviewerSpecs: Array<{ childSessionId: string; prompt: string }> = []
+
+  async run(
+    spec: ArenaRuntimeSpec,
+    onProgress: (progress: ArenaProgress) => Promise<void>,
+    signal: AbortSignal,
+  ): Promise<ArenaRuntimeResult> {
+    signal.throwIfAborted()
+    if (spec.role === 'builder') {
+      const usage = { ...zeroTokenUsage(), inputTokens: 2, outputTokens: 1, totalTokens: 3 }
+      await onProgress({ notifications: 1, events: 1, toolCalls: 0, modelCalls: 1, usage, activity: [] })
+      await writeFile(join(spec.worktreePath, 'app.txt'), `base\n${spec.agentId}\n`)
+      return { finalResponse: 'built', events: 1, notifications: 1, usage }
+    }
+    this.reviewerSpecs.push({ childSessionId: spec.childSessionId, prompt: spec.prompt })
+    const repair = spec.childSessionId.includes('-repair-')
+    const outputTokens = repair ? 1 : spec.agent.maxTokens ?? 8
+    const usage = { ...zeroTokenUsage(), inputTokens: 2, outputTokens, totalTokens: 2 + outputTokens }
+    await onProgress({ notifications: 1, events: 1, toolCalls: 0, modelCalls: 1, usage, activity: [] })
+    return {
+      finalResponse: repair
+        ? JSON.stringify({ verdict: 'approve', summary: 'Recovered compact verdict', findings: [] })
+        : 'analysis consumed the entire output budget without a final JSON object',
+      events: 1,
+      notifications: 1,
+      usage,
+    }
+  }
+}
+
+class StaticPreviewRuntime implements ArenaRuntimeRunner {
+  async run(
+    spec: ArenaRuntimeSpec,
+    onProgress: (progress: ArenaProgress) => Promise<void>,
+    signal: AbortSignal,
+  ): Promise<ArenaRuntimeResult> {
+    signal.throwIfAborted()
+    const usage = { ...zeroTokenUsage(), inputTokens: 2, outputTokens: 1, totalTokens: 3 }
+    await onProgress({ notifications: 1, events: 1, toolCalls: 0, modelCalls: 1, usage, activity: [] })
+    await writeFile(join(spec.worktreePath, 'app.txt'), `base\n${spec.agentId}\n`)
+    await mkdir(join(spec.worktreePath, 'dist'))
+    await writeFile(join(spec.worktreePath, 'dist', 'index.html'), `<h1>${spec.agentId} preview</h1>\n`)
+    return { finalResponse: 'built static preview', events: 1, notifications: 1, usage }
+  }
+}
+
 class MaliciousRuntime implements ArenaRuntimeRunner {
   async run(
     spec: ArenaRuntimeSpec,
@@ -368,6 +417,30 @@ class NoInvocationRuntime implements ArenaRuntimeRunner {
 }
 
 describe('ArenaService over real Git worktrees', () => {
+  it('creates a runnable, clean, committed demo repository for Web onboarding', async () => {
+    const stateRoot = await temporaryDirectory('web-demo-state')
+    const service = await serviceWith(new EditingRuntime(), stateRoot)
+
+    const demo = await service.createDemoProject()
+    expect(demo).toMatchObject({ template: 'commonjs-sum' })
+    expect(demo.path.startsWith(join(stateRoot, 'demos'))).toBe(true)
+    expect(demo.suggestedTask).toContain('sum.js')
+    expect(JSON.parse(await readFile(join(demo.path, 'package.json'), 'utf8'))).toMatchObject({
+      private: true, scripts: { test: 'node --test' },
+    })
+    expect(await readFile(join(demo.path, 'sum.js'), 'utf8')).toContain('return 0')
+    expect(await readFile(join(demo.path, 'sum.test.js'), 'utf8')).toContain('rejects non-number and non-finite elements')
+    const policy = JSON.parse(await readFile(join(demo.path, '.dsh', 'arena-policy.json'), 'utf8')) as {
+      rules: { requireProjectTests: boolean; judgeCommands: Array<{ command: string; args: string[] }> }
+    }
+    expect(policy.rules.requireProjectTests).toBe(true)
+    expect(policy.rules.judgeCommands).toEqual([
+      expect.objectContaining({ command: 'node', args: ['--test'] }),
+    ])
+    expect(await git(demo.path, 'status', '--short')).toBe('')
+    expect((await git(demo.path, 'rev-list', '--count', 'HEAD')).trim()).toBe('1')
+  })
+
   it('reports secret-free preflight blockers before spending model tokens', async () => {
     const stateRoot = await temporaryDirectory('preflight-state')
     const service = await serviceWith(new EditingRuntime(), stateRoot, MissingCredentials)
@@ -482,7 +555,8 @@ describe('ArenaService over real Git worktrees', () => {
     expect(trackedDiff.diff).toContain('+evidence')
     const untrackedDiff = await service.candidateFileDiff(completed.runId, 'evidence', 'proof.sh')
     expect(untrackedDiff).toMatchObject({ contenderId: 'evidence', truncated: false, file: { path: 'proof.sh', untracked: true } })
-    expect(untrackedDiff.diff).toContain('new file mode 100755')
+    const expectedProofMode = portableUntrackedMode(0o755)
+    expect(untrackedDiff.diff).toContain(`new file mode ${(expectedProofMode & 0o111) === 0 ? '100644' : '100755'}`)
     expect(untrackedDiff.diff).toContain('+echo proof')
 
     const preview = await service.previewPromotion(completed.runId, 'evidence')
@@ -492,9 +566,9 @@ describe('ArenaService over real Git worktrees', () => {
     const promoted = await service.confirmPromotion(preview.token)
     expect(promoted.promotion?.contenderId).toBe('evidence')
     expect(promoted.promotionTransaction?.phase).toBe('committed')
-    expect(await readFile(join(repo, 'app.txt'), 'utf8')).toBe('base\nevidence\n')
+    expect((await readFile(join(repo, 'app.txt'), 'utf8')).replaceAll('\r\n', '\n')).toBe('base\nevidence\n')
     expect(await readFile(join(repo, 'proof.sh'), 'utf8')).toBe('#!/bin/sh\necho proof')
-    expect((await stat(join(repo, 'proof.sh'))).mode & 0o777).toBe(0o755)
+    expect(portableUntrackedMode((await stat(join(repo, 'proof.sh'))).mode)).toBe(expectedProofMode)
     await expect(service.confirmPromotion(preview.token)).rejects.toThrow('missing or expired')
 
     const cleaned = await service.cleanup(completed.runId)
@@ -540,6 +614,49 @@ describe('ArenaService over real Git worktrees', () => {
     expect(runtime.reviewPrompts.every(prompt => !prompt.includes('fixture-direct') && !prompt.includes('fixture-evidence'))).toBe(true)
   })
 
+  it('projects a bounded portable report without local execution or raw Session evidence', async () => {
+    const repo = await repository('portable-report')
+    const stateRoot = await temporaryDirectory('portable-report-state')
+    const config = testConfig(stateRoot, true)
+    const service = await serviceWith(new ReviewingRuntime(), stateRoot, ConfiguredCredentials, config)
+    const sensitiveToken = 'sk-portablefixture1234567890'
+    const completed = await terminalRun(service, (await service.start({
+      task: `Review ${repo} and ${stateRoot} using FIXTURE_API_KEY=${sensitiveToken}`,
+      workspaceId: 'workspace',
+      cwd: repo,
+    })).runId)
+
+    const report = service.report(completed.runId)
+    const serialized = JSON.stringify(report)
+    expect(report.schemaVersion).toBe(1)
+    expect(report.status).toBe('completed')
+    expect(report.privacy.reviewBeforeSharing).toBe(true)
+    expect(report.privacy.redactionsApplied).toBeGreaterThanOrEqual(3)
+    expect(report.contenders).toHaveLength(2)
+    expect(report.contenders[0]?.artifact?.changedFiles).toEqual([
+      expect.objectContaining({ path: 'app.txt' }),
+    ])
+    expect(report.contenders.flatMap(contender => contender.reviews).map(review => review.summary))
+      .toEqual(expect.arrayContaining([expect.stringContaining('approved exact artifact')]))
+    expect(report.contenders[0]?.evaluation?.checks[0]).not.toHaveProperty('argv')
+    expect(report.contenders[0]?.evaluation?.checks[0]).not.toHaveProperty('stdout')
+    expect(report.contenders[0]?.evaluation?.checks[0]).not.toHaveProperty('stderr')
+    for (const contender of completed.contenders) {
+      expect(serialized).not.toContain(contender.worktreePath)
+      expect(serialized).not.toContain(contender.childSessionId)
+      for (const review of contender.reviews) expect(serialized).not.toContain(review.childSessionId)
+    }
+    expect(serialized).not.toContain(repo)
+    expect(serialized).not.toContain(stateRoot)
+    expect(serialized).not.toContain('FIXTURE_API_KEY')
+    expect(serialized).not.toContain(sensitiveToken)
+    expect(serialized).not.toContain('fixture-secret')
+    expect(serialized).not.toContain('process.exit')
+    expect(serialized).not.toContain('node:fs')
+    expect(serialized).not.toContain('finalResponse')
+    expect(serialized).not.toContain('diffPreview')
+  })
+
   it('fails closed on malformed reviewer output and skips security review after logic rejection', async () => {
     const repo = await repository('invalid-review')
     const stateRoot = await temporaryDirectory('invalid-review-state')
@@ -551,12 +668,96 @@ describe('ArenaService over real Git worktrees', () => {
       task: 'Reject malformed reviews', workspaceId: 'workspace', cwd: repo,
     })).runId)
 
-    expect(failed.status).toBe('failed')
+    expect(failed.status).toBe('completed')
+    expect(failed.error).toContain('evaluation nodes were unavailable')
     expect(failed.winner).toBeUndefined()
     expect(failed.contenders.flatMap(contender => contender.reviews.filter(review => review.stage === 'logic'))
       .every(review => review.status === 'failed' && review.error?.includes('valid JSON object'))).toBe(true)
+    expect(failed.contenders.flatMap(contender => contender.reviews.filter(review => review.stage === 'logic'))
+      .every(review => review.failureCode === 'invalid-output' && review.repairAttempts === 1 && review.attempts === 2)).toBe(true)
+    expect(failed.contenders.every(contender => contender.evidence?.decision.stages
+      .find(stage => stage.stage === 'logic')?.status === 'unavailable')).toBe(true)
+    expect(failed.contenders.every(contender => contender.evidence?.decision.status === 'unavailable')).toBe(true)
+    expect(failed.contenders.every(contender => contender.status === 'evaluation-unavailable')).toBe(true)
     expect(failed.contenders.flatMap(contender => contender.reviews.filter(review => review.stage === 'security'))
       .every(review => review.status === 'skipped')).toBe(true)
+  })
+
+  it('recovers an output-exhausted Reviewer with one compact JSON finalization turn', async () => {
+    const repo = await repository('review-repair')
+    const stateRoot = await temporaryDirectory('review-repair-state')
+    const config = testConfig(stateRoot, true)
+    config.reviewRepairMaxTokens = 4
+    for (const reviewer of config.reviewers) reviewer.maxTokens = 8
+    const runtime = new ExhaustedThenJsonRuntime()
+    const service = await serviceWith(runtime, stateRoot, ConfiguredCredentials, config)
+
+    const completed = await terminalRun(service, (await service.start({
+      task: 'Recover structured Reviewer output', workspaceId: 'workspace', cwd: repo,
+    })).runId)
+
+    expect(completed.status, completed.error).toBe('completed')
+    const reviews = completed.contenders.flatMap(contender => contender.reviews)
+    expect(reviews).toHaveLength(4)
+    expect(reviews.every(review => review.status === 'approved')).toBe(true)
+    expect(reviews.every(review => review.attempts === 2 && review.repairAttempts === 1)).toBe(true)
+    expect(reviews.every(review => review.usage.outputTokens === 9 && review.progress.modelCalls === 2)).toBe(true)
+    expect(reviews.every(review => review.failureCode === undefined && review.error === undefined)).toBe(true)
+    const repairSpecs = runtime.reviewerSpecs.filter(spec => spec.childSessionId.includes('-repair-'))
+    expect(repairSpecs).toHaveLength(4)
+    expect(repairSpecs.every(spec => spec.childSessionId.endsWith('-repair-1'))).toBe(true)
+    expect(repairSpecs.every(spec => spec.prompt.includes('UNTRUSTED_ARTIFACT_BEGIN'))).toBe(true)
+    expect(repairSpecs.every(spec => spec.prompt.includes('REVIEW_OUTPUT_FINALIZATION'))).toBe(true)
+  })
+
+  it('starts a sealed static candidate on loopback only after acknowledgement, then stops and cleans it', async () => {
+    const repo = await repository('candidate-preview')
+    const stateRoot = await temporaryDirectory('candidate-preview-state')
+    const service = await serviceWith(new StaticPreviewRuntime(), stateRoot)
+    const completed = await terminalRun(service, (await service.start({
+      task: 'Build a previewable static result', workspaceId: 'workspace', cwd: repo,
+    })).runId)
+
+    await expect(service.recordHumanEvaluation(completed.runId, 'direct', 'passed', undefined, true))
+      .rejects.toThrow('successfully open this candidate preview')
+    await expect(service.startCandidatePreview(completed.runId, 'direct', false)).rejects.toThrow('explicit acknowledgement')
+    const started = await service.startCandidatePreview(completed.runId, 'direct', true)
+    expect(started.status, JSON.stringify(started)).toBe('running')
+    expect(started.readyAt).toEqual(expect.any(Number))
+    expect(started.launch).toMatchObject({ kind: 'static-output', label: 'dist/index.html' })
+    expect(started.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/u)
+    expect(await (await fetch(started.url!)).text()).toContain('direct preview')
+    expect(service.candidatePreviewStatus(completed.runId, 'direct').status).toBe('running')
+
+    await expect(service.recordHumanEvaluation(completed.runId, 'direct', 'passed', 'Works.', false))
+      .rejects.toThrow('explicit local-user acknowledgement')
+    const sensitiveNote = `Opened ${repo}; api_key=sk-humanfixture1234567890`
+    const evaluated = await service.recordHumanEvaluation(completed.runId, 'direct', 'passed', sensitiveNote, true)
+    expect(evaluated.contenders.find(contender => contender.id === 'direct')?.humanEvaluation).toMatchObject({
+      artifactHash: started.artifactHash,
+      verdict: 'passed',
+      note: sensitiveNote,
+      source: 'loopback-user-attestation',
+      previewReadyAt: started.readyAt,
+    })
+    expect(evaluated.winner).toEqual(completed.winner)
+    const portable = service.report(completed.runId)
+    const portableText = JSON.stringify(portable)
+    expect(portable.contenders.find(contender => contender.id === 'direct')?.humanEvaluation)
+      .toMatchObject({ verdict: 'passed', artifactHash: started.artifactHash })
+    expect(portableText).not.toContain(repo)
+    expect(portableText).not.toContain('sk-humanfixture1234567890')
+
+    const stopped = await service.stopCandidatePreview(completed.runId, 'direct')
+    expect(stopped.status).toBe('stopped')
+    expect(stopped.readyAt).toBe(started.readyAt)
+    expect(stopped.url).toBeUndefined()
+    expect(await git(repo, 'status', '--porcelain=v1', '--untracked-files=all')).toBe('')
+    expect(await git(repo, 'worktree', 'list', '--porcelain')).not.toContain('candidate-previews')
+
+    const recoveredService = await serviceWith(new NoInvocationRuntime(), stateRoot)
+    expect(recoveredService.get(completed.runId).contenders.find(contender => contender.id === 'direct')?.humanEvaluation)
+      .toMatchObject({ verdict: 'passed', artifactHash: started.artifactHash })
   })
 
   it('blocks high-risk artifacts before any candidate-controlled test command executes', async () => {
@@ -568,13 +769,19 @@ describe('ArenaService over real Git worktrees', () => {
       task: 'Must reject unsafe installer', workspaceId: 'workspace', cwd: repo,
     })).runId)
 
-    expect(failed.status).toBe('failed')
+    expect(failed.status).toBe('completed')
     for (const contender of failed.contenders) {
       expect(contender.evidence?.securityFindings).toEqual([
         expect.objectContaining({ ruleId: 'download-pipe-shell', severity: 'high' }),
       ])
       expect(contender.evidence?.checks.find(check => check.id === 'fixture-check')?.status).toBe('skipped')
       expect(contender.evidence?.decision.status).toBe('rejected')
+      expect(service.candidatePreviewStatus(failed.runId, contender.id)).toMatchObject({
+        status: 'unavailable',
+        error: expect.stringContaining('security preflight did not pass'),
+      })
+      await expect(service.startCandidatePreview(failed.runId, contender.id, true))
+        .rejects.toThrow('security preflight did not pass')
     }
   })
 
@@ -657,7 +864,7 @@ describe('ArenaService over real Git worktrees', () => {
   })
 
   it('rolls back only exact Arena-owned partial promotion effects after Host restart', async () => {
-    const repo = await repository('promotion-recovery-partial')
+    const repo = await repository('promotion-recovery-partial', true)
     const stateRoot = await temporaryDirectory('promotion-recovery-partial-state')
     const config = testConfig(stateRoot)
     const service = await serviceWith(new EditingRuntime(), stateRoot, ConfiguredCredentials, config)
@@ -677,9 +884,12 @@ describe('ArenaService over real Git worktrees', () => {
 
     const recoveredService = await serviceWith(new NoInvocationRuntime(), stateRoot, ConfiguredCredentials, config)
     const recovered = recoveredService.get(completed.runId)
-    expect(recovered.promotionTransaction?.phase).toBe('rolled-back')
+    expect(
+      recovered.promotionTransaction?.phase,
+      recovered.promotionTransaction?.error,
+    ).toBe('rolled-back')
     expect(recovered.promotion).toBeUndefined()
-    expect(await readFile(join(repo, 'app.txt'), 'utf8')).toBe('base\n')
+    expect((await readFile(join(repo, 'app.txt'), 'utf8')).replaceAll('\r\n', '\n')).toBe('base\n')
     expect(await git(repo, 'status', '--porcelain=v1', '--untracked-files=all')).toBe('')
   })
 
@@ -753,6 +963,36 @@ describe('ArenaService over real Git worktrees', () => {
     expect((await requiredService.preflight()).blockers).toEqual(expect.arrayContaining([
       expect.stringContaining('independence metadata is incomplete'),
     ]))
+  })
+
+  it('fails closed at admission when a paid-usage limit is disabled without acknowledgement', async () => {
+    const repo = await repository('unlimited-budget')
+    const stateRoot = await temporaryDirectory('unlimited-budget-state')
+    const config = testConfig(stateRoot)
+    config.maxRunTokens = 0
+    config.maxRunModelCalls = 0
+    const runtime = new BlockingRuntime()
+    const service = await serviceWith(runtime, stateRoot, ConfiguredCredentials, config)
+    const preflight = await service.preflight(repo)
+    expect(preflight.budget).toMatchObject({
+      unlimited: ['totalTokens', 'modelCalls'],
+      requiresAcknowledgement: true,
+    })
+
+    await expect(service.start({
+      task: 'Do not spend without consent', workspaceId: 'workspace', cwd: repo,
+    })).rejects.toThrow('acknowledgeUnlimitedBudget=true')
+
+    const admitted = await service.start({
+      task: 'Proceed after consent', workspaceId: 'workspace', cwd: repo,
+      acknowledgeUnlimitedBudget: true,
+    })
+    expect(admitted.budget.unlimitedBudgetAcknowledgedAt).toEqual(expect.any(Number))
+    await runtime.started
+    await service.cancel(admitted.runId)
+    await runtime.stopped
+    expect(service.report(admitted.runId).budget.unlimitedBudgetAcknowledgedAt)
+      .toBe(admitted.budget.unlimitedBudgetAcknowledgedAt)
   })
 
   it.each([
@@ -829,6 +1069,42 @@ describe('ArenaService over real Git worktrees', () => {
     expect(builderSpecs[0]?.systemPrompt).toBe(builderSpecs[1]?.systemPrompt)
     expect(completed.sharedContext?.cacheEligibleContenders).toEqual(['direct', 'evidence'])
     expect(await readFile(join(stateRoot, 'runs', completed.runId, 'shared-context.txt'), 'utf8')).toContain('base\n')
+  })
+
+  it('does not resume a legacy unlimited run that has no durable acknowledgement', async () => {
+    const repo = await repository('legacy-unlimited-recovery')
+    const stateRoot = await temporaryDirectory('legacy-unlimited-recovery-state')
+    const config = testConfig(stateRoot)
+    const policy = await resolveArenaPolicy(config, repo)
+    const store = new ArenaStore(stateRoot, () => {})
+    await store.initialize()
+    const now = Date.now()
+    const budget = initialRunBudget(config)
+    budget.limits.totalTokens = 0
+    budget.limits.modelCalls = 0
+    await store.create({
+      version: ARENA_STATE_VERSION,
+      runId: 'arena-legacy-unlimited',
+      workspaceId: 'workspace',
+      task: 'Legacy unlimited run',
+      repoRoot: repo,
+      baseCommit: (await git(repo, 'rev-parse', 'HEAD')).trim(),
+      status: 'running',
+      revision: 0,
+      createdAt: now,
+      updatedAt: now,
+      policy: policy.snapshot,
+      budget,
+      contenders: [],
+    })
+
+    const runtime = new NoInvocationRuntime()
+    const service = await serviceWith(runtime, stateRoot, ConfiguredCredentials, config)
+    const blocked = service.get('arena-legacy-unlimited')
+    expect(runtime.runs).toBe(0)
+    expect(blocked.status).toBe('failed')
+    expect(blocked.error).toContain('unacknowledged unlimited totalTokens and modelCalls budget')
+    expect(blocked.error).toContain('retry it with explicit consent')
   })
 
   it('resumes durable Builder checkpoints after Host restart without invoking Builders again', async () => {

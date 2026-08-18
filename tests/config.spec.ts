@@ -1,9 +1,24 @@
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { Config, resolveConfig } from '../src/config.ts'
+import {
+  Config,
+  DEFAULT_MAX_RUN_MODEL_CALLS,
+  DEFAULT_MAX_RUN_TOKENS,
+  resolveConfig,
+} from '../src/config.ts'
 
 describe('Arena configuration resolution', () => {
+  it('keeps the zero-command default policy internally runnable', () => {
+    const resolved = resolveConfig(Config({ stateRoot: join(tmpdir(), 'dsh-arena-config-test') } as Config))
+
+    expect(resolved.judgeCommands).toEqual([])
+    expect(resolved.requireProjectTests).toBe(false)
+    expect(resolved.reviewRepairMaxTokens).toBe(4_096)
+    expect(resolved.maxRunTokens).toBe(DEFAULT_MAX_RUN_TOKENS)
+    expect(resolved.maxRunModelCalls).toBe(DEFAULT_MAX_RUN_MODEL_CALLS)
+  })
+
   it('omits the empty runtime override so startup selects the bundled child composition', () => {
     const resolved = resolveConfig(Config({
       stateRoot: join(tmpdir(), 'dsh-arena-config-test'),
@@ -37,6 +52,12 @@ describe('Arena configuration resolution', () => {
     for (const agent of [...config.contenders, ...config.reviewers]) agent.credentialEnv = ['CRED']
     config.runtimeEnv = { CRED: 'must-not-shadow-the-credential-service' }
     expect(() => resolveConfig(config)).toThrow('cannot override credential reference CRED')
+  })
+
+  it('refuses runtime environment overrides for Host profile roots', () => {
+    const config = Config({ stateRoot: join(tmpdir(), 'dsh-arena-config-test') } as Config)
+    config.runtimeEnv = { DSH_AGENTS_HOME: '/tmp/not-an-arena-child-home' }
+    expect(() => resolveConfig(config)).toThrow('cannot override Arena-owned DSH_AGENTS_HOME')
   })
 
   it('keeps project policy as arbitrary argv rather than a language-specific preset', () => {

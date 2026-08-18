@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { currentBudgetExhaustion, refreshRunBudget } from '../src/budget.ts'
+import {
+  assertBudgetAcknowledged,
+  configuredBudgetPolicy,
+  currentBudgetExhaustion,
+  refreshRunBudget,
+} from '../src/budget.ts'
+import { Config, resolveConfig } from '../src/config.ts'
 import { ARENA_STATE_VERSION, zeroTokenUsage, type ArenaRunState } from '../src/types.ts'
 
 function state(): ArenaRunState {
@@ -42,6 +48,25 @@ function state(): ArenaRunState {
 }
 
 describe('whole-run Arena budgets', () => {
+  it('projects finite defaults and requires acknowledgement only for explicitly disabled paid limits', () => {
+    const config = resolveConfig(Config({ stateRoot: '/tmp/arena-budget-policy' } as Config))
+    expect(configuredBudgetPolicy(config)).toMatchObject({
+      limits: { totalTokens: 400_000, modelCalls: 48, wallTimeMs: 1_200_000 },
+      unlimited: [],
+      requiresAcknowledgement: false,
+    })
+    expect(() => assertBudgetAcknowledged(config, false)).not.toThrow()
+
+    config.maxRunTokens = 0
+    config.maxRunModelCalls = 0
+    expect(configuredBudgetPolicy(config)).toMatchObject({
+      unlimited: ['totalTokens', 'modelCalls'],
+      requiresAcknowledgement: true,
+    })
+    expect(() => assertBudgetAcknowledged(config, false)).toThrow('acknowledgeUnlimitedBudget=true')
+    expect(() => assertBudgetAcknowledged(config, true)).not.toThrow()
+  })
+
   it('aggregates every Builder and Reviewer without double-counting usage', () => {
     const run = state()
     refreshRunBudget(run, 1_500)

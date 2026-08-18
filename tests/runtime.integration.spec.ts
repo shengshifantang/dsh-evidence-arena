@@ -107,7 +107,11 @@ describe('Arena SDK provider integration', () => {
     expect(server.requests).toHaveLength(1)
     expect(server.requests[0]?.path).toBe('/chat/completions')
     expect(server.requests[0]?.headers.authorization).toBe('Bearer native-fixture-secret')
-    expect(server.requests[0]?.body).toMatchObject({ model: 'deepseek-v4-flash' })
+    expect(server.requests[0]?.body).toMatchObject({
+      model: 'deepseek-v4-flash',
+      thinking: { type: 'disabled' },
+    })
+    expect(server.requests[0]?.body).not.toHaveProperty('reasoning_effort')
     expect(server.requests[0]?.body).not.toHaveProperty('tools')
     expect(JSON.stringify(server.requests[0]?.body)).not.toContain('Runtime fixture')
     expect(fixture.resolvedRefs.map(String)).toEqual(['DEEPSEEK_API_KEY'])
@@ -144,13 +148,28 @@ describe('Arena SDK provider integration', () => {
     }
     const config = resolveConfig(raw)
     const fixture = credentials({ MOCK_GATEWAY_API_KEY: 'gateway-fixture-secret' })
-    const { result } = await run(config, fixture.provider, spec(root, raw.contenders[0], 'gateway', 'builder'))
+    const parentProfile = join(root, 'sensitive-host-profile')
+    const previousDshHome = process.env.DSH_HOME
+    process.env.DSH_HOME = parentProfile
+    let result: Awaited<ReturnType<typeof run>>['result']
+    try {
+      ;({ result } = await run(config, fixture.provider, spec(root, raw.contenders[0], 'gateway', 'builder')))
+    } finally {
+      if (previousDshHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previousDshHome
+    }
 
     expect(result.finalResponse).toContain('gateway-ready')
     expect(server.requests).toHaveLength(1)
     expect(server.requests[0]?.path).toBe('/v1/chat/completions')
     expect(server.requests[0]?.headers.authorization).toBe('Bearer gateway-fixture-secret')
     expect(server.requests[0]?.body).toMatchObject({ model: 'mock-model' })
+    const request = JSON.stringify(server.requests[0]?.body)
+    expect(request).toContain('"name":"glob"')
+    expect(request).toContain('"name":"grep"')
+    expect(request).toContain('"name":"str_replace_editor"')
+    expect(request).toContain('"name":"subagent"')
+    expect(request).not.toContain(parentProfile)
     expect(fixture.resolvedRefs.map(String)).toEqual(['MOCK_GATEWAY_API_KEY'])
   }, 30_000)
 })

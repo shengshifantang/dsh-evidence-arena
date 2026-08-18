@@ -1,7 +1,7 @@
 /** Whole-run token, model-call, wall-time, and approval-triggered early-stop accounting. */
 
 import type { ResolvedConfig } from './config.ts'
-import type { ArenaRunBudget, ArenaRunState } from './types.ts'
+import type { ArenaBudgetPolicy, ArenaRunBudget, ArenaRunState } from './types.ts'
 
 /** Cancellation reason that distinguishes budget exhaustion from a user cancellation. */
 export class ArenaBudgetExceededError extends Error {
@@ -19,18 +19,49 @@ export class ArenaEarlyStopError extends Error {
   }
 }
 
-/** Initial durable budget projection for one admitted run. */
-export function initialRunBudget(config: ResolvedConfig): ArenaRunBudget {
+/** Return every paid-usage limit deliberately disabled in a durable run projection. */
+export function unlimitedBudgetKinds(limits: ArenaRunBudget['limits']): ArenaBudgetPolicy['unlimited'] {
+  const unlimited: ArenaBudgetPolicy['unlimited'] = []
+  if (limits.totalTokens === 0) unlimited.push('totalTokens')
+  if (limits.modelCalls === 0) unlimited.push('modelCalls')
+  return unlimited
+}
+
+/** Project the configured admission policy without exposing unrelated Host configuration. */
+export function configuredBudgetPolicy(config: ResolvedConfig): ArenaBudgetPolicy {
+  const limits = {
+    totalTokens: config.maxRunTokens,
+    modelCalls: config.maxRunModelCalls,
+    wallTimeMs: config.runTimeoutMs,
+  }
+  const unlimited = unlimitedBudgetKinds(limits)
   return {
-    limits: {
-      totalTokens: config.maxRunTokens,
-      modelCalls: config.maxRunModelCalls,
-      wallTimeMs: config.runTimeoutMs,
-    },
+    limits,
+    stopAfterApproved: config.stopAfterApproved,
+    unlimited,
+    requiresAcknowledgement: unlimited.length > 0,
+  }
+}
+
+/** Fail closed when a Profile deliberately disables either paid-usage guardrail. */
+export function assertBudgetAcknowledged(config: ResolvedConfig, acknowledged: boolean | undefined): void {
+  const policy = configuredBudgetPolicy(config)
+  if (!policy.requiresAcknowledgement || acknowledged === true) return
+  throw new Error(
+    `Arena run has unlimited ${policy.unlimited.join(' and ')} budget; explicit acknowledgeUnlimitedBudget=true is required`,
+  )
+}
+
+/** Initial durable budget projection for one admitted run. */
+export function initialRunBudget(config: ResolvedConfig, unlimitedBudgetAcknowledgedAt?: number): ArenaRunBudget {
+  const policy = configuredBudgetPolicy(config)
+  return {
+    limits: policy.limits,
     consumed: { totalTokens: 0, modelCalls: 0, wallTimeMs: 0 },
     status: 'within-budget',
-    stopAfterApproved: config.stopAfterApproved,
+    stopAfterApproved: policy.stopAfterApproved,
     stoppedContenders: [],
+    ...unlimitedBudgetAcknowledgedAt === undefined ? {} : { unlimitedBudgetAcknowledgedAt },
   }
 }
 

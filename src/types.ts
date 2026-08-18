@@ -6,6 +6,9 @@ export const ARENA_STATE_VERSION = 4 as const
 /** Repository policy document format understood by this Arena release. */
 export const ARENA_POLICY_VERSION = 1 as const
 
+/** Portable, privacy-bounded evaluation report format. */
+export const ARENA_REPORT_VERSION = 1 as const
+
 /** Lifecycle of one complete multi-contender run. */
 export type ArenaRunStatus =
   | 'queued'
@@ -28,6 +31,7 @@ export type ArenaContenderStatus =
   | 'judging'
   | 'reviewing'
   | 'passed'
+  | 'evaluation-unavailable'
   | 'rejected'
   | 'failed'
   | 'cancelled'
@@ -147,21 +151,70 @@ export interface ArenaReviewState {
   response?: string
   responseTruncated?: boolean
   error?: string
+  /** Machine-readable reason when review infrastructure did not produce a verdict. */
+  failureCode?: 'output-exhausted' | 'invalid-output' | 'runtime-error'
+  /** Number of bounded JSON-finalization turns attempted after an invalid first response. */
+  repairAttempts?: number
   /** Number of child invocations, including a restart recovery attempt. */
   attempts: number
 }
 
 /** Stage-by-stage final decision; only `approved` candidates are promotable. */
 export interface ArenaApprovalDecision {
-  status: 'approved' | 'rejected'
+  /** `unavailable` means the evaluation infrastructure produced no verdict; it is not a code rejection. */
+  status: 'approved' | 'rejected' | 'unavailable'
   decidedAt: number
   reasons: string[]
   stages: Array<{
     stage: ArenaGateStage
-    status: 'approved' | 'rejected' | 'not-configured'
+    /** `unavailable` is fail-closed infrastructure failure, not a model rejection. */
+    status: 'approved' | 'rejected' | 'unavailable' | 'not-configured'
     requiredNodes: number
     passedNodes: number
   }>
+}
+
+/** Ephemeral, Host-owned test launch for one exact sealed candidate artifact. */
+export interface ArenaCandidatePreview {
+  runId: string
+  contenderId: string
+  artifactHash: string
+  status: 'idle' | 'starting' | 'running' | 'stopped' | 'failed' | 'unavailable'
+  /** Human-reviewable launch recipe selected by the Host, never supplied by the browser. */
+  launch?: {
+    kind: 'static-output' | 'package-script'
+    label: string
+    argv: string[]
+  }
+  /** Loopback-only URL published after the readiness probe succeeds. */
+  url?: string
+  pid?: number
+  startedAt?: number
+  /** First instant at which the loopback readiness probe succeeded. */
+  readyAt?: number
+  finishedAt?: number
+  stdout: string
+  stderr: string
+  outputTruncated: boolean
+  error?: string
+  safety: {
+    explicitStartRequired: true
+    disposableWorktree: true
+    loopbackRequested: true
+    networkIsolated: false
+    hostReadsIsolated: false
+    sandboxEnforcement?: ArenaSandboxFacts['enforcement']
+  }
+}
+
+/** Explicit local-user attestation over one successfully previewed sealed artifact. */
+export interface ArenaHumanEvaluation {
+  artifactHash: string
+  verdict: 'passed' | 'failed' | 'inconclusive'
+  note?: string
+  recordedAt: number
+  previewReadyAt: number
+  source: 'loopback-user-attestation'
 }
 
 /** Captured, promotion-ready evidence for a contender. */
@@ -233,6 +286,8 @@ export interface ArenaContenderState {
   reviews: ArenaReviewState[]
   sealedArtifact?: ArenaSealedArtifact
   evidence?: ArenaEvidence
+  /** Human UAT is audit evidence only and never mutates automated approval or ranking. */
+  humanEvaluation?: ArenaHumanEvaluation
   cleanedAt?: number
 }
 
@@ -259,8 +314,10 @@ export interface ArenaRunMetrics {
   }>
 }
 
-/** Host-enforced whole-run budget and the first observed exhaustion fact. */
-export interface ArenaRunBudget {
+export type ArenaUnlimitedBudgetKind = 'totalTokens' | 'modelCalls'
+
+/** Admission-time budget policy shown before a paid run starts. */
+export interface ArenaBudgetPolicy {
   limits: {
     /** Zero disables the corresponding token limit. */
     totalTokens: number
@@ -268,6 +325,17 @@ export interface ArenaRunBudget {
     modelCalls: number
     wallTimeMs: number
   }
+  /** Zero disables approval-triggered sibling cancellation. */
+  stopAfterApproved: number
+  /** Limits explicitly disabled by Host configuration. */
+  unlimited: ArenaUnlimitedBudgetKind[]
+  /** Every new run/retry must acknowledge disabled spend limits. */
+  requiresAcknowledgement: boolean
+}
+
+/** Host-enforced whole-run budget and the first observed exhaustion fact. */
+export interface ArenaRunBudget {
+  limits: ArenaBudgetPolicy['limits']
   consumed: {
     totalTokens: number
     modelCalls: number
@@ -283,6 +351,8 @@ export interface ArenaRunBudget {
   /** Zero disables approval-triggered sibling cancellation. */
   stopAfterApproved: number
   stoppedContenders: string[]
+  /** Durable local-user consent required before an unlimited paid-usage run can resume. */
+  unlimitedBudgetAcknowledgedAt?: number
 }
 
 /** One model deployment identity used for multi-dimensional independence checks. */
@@ -414,6 +484,7 @@ export interface ArenaStateEvent {
     | 'contender/progress'
     | 'contender/artifact'
     | 'contender/evidence'
+    | 'contender/human-evaluation'
     | 'review/status'
     | 'run/winner'
     | 'run/recovered'
@@ -496,6 +567,8 @@ export interface ArenaPreflight {
     dimensions: Array<'provider' | 'organization' | 'gateway' | 'modelFamily'>
   }>
   policy: ArenaPolicySnapshot
+  /** Host-enforced run limits, including any explicitly unlimited dimensions. */
+  budget: ArenaBudgetPolicy
   remediations: ArenaPreflightRemediation[]
   gates: {
     requireProjectTests: boolean
@@ -531,6 +604,14 @@ export interface ArenaSetupReport {
   policyText: string
   loadedPolicyDigest?: string
   canWritePolicy: boolean
+}
+
+/** A bounded, disposable onboarding repository created by Arena on explicit request. */
+export interface ArenaDemoProject {
+  path: string
+  template: 'commonjs-sum'
+  createdAt: number
+  suggestedTask: string
 }
 
 /** One argv-only judge command; no shell parsing occurs. */
@@ -575,6 +656,130 @@ export interface ArenaRunSummary {
   winnerId?: string
   promotedId?: string
   totalTokens?: number
+}
+
+/** Content-bounded child-runtime metrics safe to place in a portable report. */
+export interface ArenaPortableProgress {
+  notifications: number
+  events: number
+  toolCalls: number
+  modelCalls: number
+  usage: ArenaTokenUsage
+}
+
+/** Deterministic gate metadata with command arguments and output deliberately omitted. */
+export interface ArenaPortableCheck {
+  id: string
+  label: string
+  stage: ArenaGateStage
+  kind: ArenaCheckResult['kind']
+  required: boolean
+  status: ArenaCheckResult['status']
+  exitCode: number | null
+  signal: string | null
+  timedOut: boolean
+  startedAt: number
+  finishedAt: number
+  durationMs: number
+  outputTruncated: boolean
+  sandbox?: ArenaSandboxFacts
+}
+
+/** Independent Reviewer result without raw model output, errors, or child Session identity. */
+export interface ArenaPortableReview {
+  id: string
+  label: string
+  stage: ArenaReviewState['stage']
+  provider: string
+  model: string
+  identity: ArenaModelIdentity
+  artifactHash?: string
+  status: ArenaReviewState['status']
+  startedAt?: number
+  finishedAt?: number
+  durationMs?: number
+  attempts: number
+  progress: ArenaPortableProgress
+  summary?: string
+  findings: ArenaSecurityFinding[]
+  failureCode?: ArenaReviewState['failureCode']
+  repairAttempts?: number
+}
+
+/** Immutable candidate artifact metadata; full patch and diff text remain local. */
+export interface ArenaPortableArtifact {
+  artifactHash: string
+  headCommit: string
+  patchBytes: number
+  untrackedBytes: number
+  changedFiles: ArenaChangedFile[]
+  addedLines: number
+  deletedLines: number
+  sealedAt: number
+}
+
+/** Gate and verdict projection bound to one sealed candidate artifact. */
+export interface ArenaPortableEvaluation {
+  patchHash: string
+  checks: ArenaPortableCheck[]
+  securityFindings: ArenaSecurityFinding[]
+  decision: ArenaApprovalDecision
+}
+
+/** One contender in a portable report. Local execution identifiers are intentionally absent. */
+export interface ArenaPortableContender {
+  id: string
+  label: string
+  provider: string
+  model: string
+  identity: ArenaModelIdentity
+  status: ArenaContenderStatus
+  checkpoint: ArenaContenderCheckpoint
+  attempts: number
+  startedAt?: number
+  builderDurationMs?: number
+  finishedAt?: number
+  cleanedAt?: number
+  progress: ArenaPortableProgress
+  artifact?: ArenaPortableArtifact
+  evaluation?: ArenaPortableEvaluation
+  humanEvaluation?: ArenaHumanEvaluation
+  reviews: ArenaPortableReview[]
+}
+
+/**
+ * Downloadable comparison evidence. It is an explicit allow-list projection, not a copy of
+ * durable Arena state: local paths, credential refs, child Session ids, raw logs, responses,
+ * command argv/output, and full diffs are excluded by construction.
+ */
+export interface ArenaPortableReport {
+  schemaVersion: typeof ARENA_REPORT_VERSION
+  generatedAt: number
+  runId: string
+  task: string
+  baseCommit: string
+  status: ArenaRunStatus
+  createdAt: number
+  updatedAt: number
+  policy: {
+    source: ArenaPolicySnapshot['source']
+    policyId: string
+    revision: string
+    digest: string
+    signature: ArenaPolicySnapshot['signature']
+  }
+  budget: ArenaRunBudget
+  contenders: ArenaPortableContender[]
+  metrics?: ArenaRunMetrics
+  winner?: ArenaWinner
+  promotion?: ArenaPromotion
+  privacy: {
+    redactionsApplied: number
+    truncationsApplied: number
+    reviewBeforeSharing: true
+    omitted: string[]
+  }
+  limitations: string[]
 }
 
 /** An all-zero usage accumulator. */

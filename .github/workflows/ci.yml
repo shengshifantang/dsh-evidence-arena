@@ -9,8 +9,40 @@ permissions:
 
 jobs:
   verify:
+    name: Verify ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: 22.19.0
+          - os: ubuntu-latest
+            node: 24
+          - os: windows-latest
+            node: 24
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+
+  clean-profile-smoke:
+    name: Clean DSH rc.7 profile smoke
+    needs: verify
     runs-on: ubuntu-latest
     steps:
+      - name: Configure isolated DSH runtime
+        run: |
+          echo "DSH_HOME=$RUNNER_TEMP/dsh-evidence-arena-profile" >> "$GITHUB_ENV"
+          echo "DSH_BIN=$RUNNER_TEMP/dsh-runtime/bin/dsh" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/dsh-runtime/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
@@ -20,5 +52,10 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm check
-      - run: npm pack --dry-run --json --ignore-scripts
+      - run: mkdir -p "$RUNNER_TEMP/arena-pack"
+      - run: pnpm pack --pack-destination "$RUNNER_TEMP/arena-pack"
+      - name: Install official DSH rc.7 in an isolated npm prefix
+        run: npm install --global --prefix "$RUNNER_TEMP/dsh-runtime" --no-audit --no-fund @deepseek-ai/dsh@0.1.0-rc.7 --registry https://registry.npmjs.org/
+      - run: |
+          "$DSH_BIN" plugin --profile web add "$RUNNER_TEMP/arena-pack/dsh-evidence-arena-0.1.0.tgz" --registry https://registry.npmjs.org/
+      - run: node scripts/smoke-profile.mjs

@@ -1,7 +1,8 @@
 /** Independent, sandboxed DeepSeek Harness SDK runtime used by builders and reviewers. */
 
 import { constants } from 'node:fs'
-import { access } from 'node:fs/promises'
+import { access, mkdir } from 'node:fs/promises'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { credentialRef, type CredentialProvider } from '@deepseek-ai/dsh-credentials'
 import { DeepSeekHarness, type HarnessNotification } from '@deepseek-ai/dsh-sdk-client'
@@ -160,6 +161,21 @@ async function runtimeEnvironment(
     )
   }
   Object.assign(env, config.runtimeEnv)
+  // Never expose the live Host profile root to a model-facing child shell.
+  // The sandbox confines writes but does not promise to confine host reads;
+  // a parent DSH_HOME may contain .credentials.yaml. Project-local Skills are
+  // still discovered from the worktree. User-wide Skills/plugins need a future
+  // explicit allowlisted pack rather than implicit profile inheritance.
+  const childHome = join(spec.childSessionRoot, 'runtime-home')
+  const childAgentsHome = join(childHome, 'agents-home')
+  await Promise.all([
+    mkdir(childHome, { recursive: true, mode: 0o700 }),
+    mkdir(childAgentsHome, { recursive: true, mode: 0o700 }),
+  ])
+  env.DSH_ARENA_CHILD_HOME = childHome
+  env.DSH_ARENA_CHILD_AGENTS_HOME = childAgentsHome
+  env.DSH_HOME = childHome
+  env.DSH_AGENTS_HOME = childAgentsHome
   env.DSH_CORDIS_CONFIG = config.runtimeConfig ?? defaultRuntimeConfigPath()
   env.DSH_CWD = spec.worktreePath
   env.DSH_SESSION_ROOT = spec.childSessionRoot

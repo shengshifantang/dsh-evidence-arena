@@ -11,7 +11,10 @@
   config:
     apiKeyEnv: !!js process.env.DSH_ARENA_API_KEY_ENV ?? 'DEEPSEEK_API_KEY'
     thinking: enabled
-    reasoningEffort: max
+    # Builders keep the strongest reasoning mode. Reviewers must emit a small,
+    # machine-validated JSON verdict, so extended hidden reasoning is disabled
+    # instead of letting it consume the entire bounded output allowance.
+    reasoningEffort: !!js "process.env.DSH_ARENA_ROLE === 'reviewer' ? 'off' : 'max'"
 
 # Harness' provider-neutral adapter. Arena gives each child only its own route
 # and only the environment references named by that agent.
@@ -69,13 +72,23 @@
 - id: agent-spine
   name: '@deepseek-ai/dsh-agent-spine-demo'
   config:
+    # Shell context and user Skill discovery point at an Arena-owned empty
+    # per-child home. Never expose the live Host profile, which may hold keys.
+    dshHome: !!js process.env.DSH_ARENA_CHILD_HOME
     persona: !!js process.env.DSH_SYSTEM_PROMPT ?? 'You are an independent Arena agent.'
     includeRuntimeContext: !!js process.env.DSH_ARENA_ROLE !== 'reviewer'
     workspaceContext: !!js "process.env.DSH_ARENA_ROLE === 'reviewer' ? false : ({ maxBytes: 65536 })"
     skills:
-      enabled: false
-    toolBash: !!js "process.platform === 'win32' || process.env.DSH_ARENA_ROLE === 'reviewer' ? false : ({ enableRunInBackground: false })"
-    toolJobs: false
+      # Builders discover repository-owned .dsh/.agents Skills plus the empty
+      # isolated user root. Reviewers remain sealed-evidence-only.
+      enabled: !!js process.env.DSH_ARENA_ROLE !== 'reviewer'
+      filesystem:
+        agentsHome: !!js process.env.DSH_ARENA_CHILD_AGENTS_HOME
+        watch: false
+    # Long engineering tasks need background servers/builds and bounded job
+    # collection. The Reviewer contract stays zero-tool.
+    toolBash: !!js "process.platform === 'win32' || process.env.DSH_ARENA_ROLE === 'reviewer' ? false : ({ enableRunInBackground: true })"
+    toolJobs: !!js "process.env.DSH_ARENA_ROLE === 'reviewer' ? false : ({})"
 
 - id: sessions
   name: '@deepseek-ai/dsh-session-persistence-jsonl'
@@ -97,6 +110,69 @@
 - id: tool-fs
   name: '@deepseek-ai/dsh-tool-fs'
   disabled: !!js process.env.DSH_ARENA_ROLE === 'reviewer'
+
+# Production coding capabilities that the stock Web standard/code presets also
+# expose. Arena composes them explicitly because an SDK subprocess is a fresh
+# Harness runtime and cannot safely inherit arbitrary live Host plugins.
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  disabled: !!js process.env.DSH_ARENA_ROLE === 'reviewer'
+  config:
+    sampleOverCapGlobResults: false
+
+- id: tool-str-replace-editor
+  name: '@deepseek-ai/dsh-tool-str-replace-editor'
+  disabled: !!js process.env.DSH_ARENA_ROLE === 'reviewer'
+  config:
+    maxOutputChars: 16000
+
+# In-process DSH subagents let a Builder split a large task without leaving its
+# isolated worktree. Every child request and token remains in the SDK session
+# event tree observed by Arena.
+- id: subagent
+  name: '@deepseek-ai/dsh-subagent'
+  disabled: !!js process.env.DSH_ARENA_ROLE === 'reviewer'
+
+- id: subagent-spawn
+  name: '@deepseek-ai/dsh-subagent-spawn-in-process'
+  disabled: !!js process.env.DSH_ARENA_ROLE === 'reviewer'
+  config:
+    providerName: spawn
+
+- id: tool-subagent-control
+  name: '@deepseek-ai/dsh-tool-subagent-control'
+  disabled: !!js process.env.DSH_ARENA_ROLE === 'reviewer'
+
+- id: tool-subagent-list-agents
+  name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+  disabled: !!js process.env.DSH_ARENA_ROLE === 'reviewer'
+
+- id: tool-subagent-report
+  name: '@deepseek-ai/dsh-tool-subagent-report'
+  disabled: !!js process.env.DSH_ARENA_ROLE === 'reviewer'
+
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  disabled: !!js process.env.DSH_ARENA_ROLE === 'reviewer'
+  config:
+    provider: spawn
+    toolName: subagent
+    backgroundMode: continuable
+
+- id: tool-result-pruner
+  name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+  disabled: !!js process.env.DSH_ARENA_ROLE === 'reviewer'
+  config:
+    thresholdChars: 8192
+    headChars: 4096
+    tailChars: 1024
+
+- id: repeat-tool-reminder
+  name: '@deepseek-ai/dsh-repeat-tool-reminder'
+  disabled: !!js process.env.DSH_ARENA_ROLE === 'reviewer'
+  config:
+    thresholds: [3, 5, 8]
+    argumentsPreviewChars: 500
 
 - id: tool-todo
   name: '@deepseek-ai/dsh-tool-todo'

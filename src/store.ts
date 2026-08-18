@@ -51,6 +51,7 @@ function assertStateEvent(value: unknown, expectedRunId: string, expectedSeq: nu
 function assertSetupReport(value: unknown, expectedWorkspaceId: string): asserts value is ArenaSetupReport {
   if (!isRecord(value)
     || !isRecord(value.preflight)
+    || !isRecord(value.preflight.budget)
     || value.workspaceId !== expectedWorkspaceId
     || typeof value.policyText !== 'string'
     || typeof value.canWritePolicy !== 'boolean'
