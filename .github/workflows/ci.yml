@@ -37,9 +37,9 @@ jobs:
     name: Clean DSH rc.7 profile smoke
     needs: verify
     runs-on: ubuntu-latest
-    env:
-      DSH_HOME: ${{ runner.temp }}/dsh-evidence-arena-profile
     steps:
+      - name: Configure isolated DSH home
+        run: echo "DSH_HOME=$RUNNER_TEMP/dsh-evidence-arena-profile" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
