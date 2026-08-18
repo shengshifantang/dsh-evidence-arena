@@ -566,7 +566,7 @@ describe('ArenaService over real Git worktrees', () => {
     const promoted = await service.confirmPromotion(preview.token)
     expect(promoted.promotion?.contenderId).toBe('evidence')
     expect(promoted.promotionTransaction?.phase).toBe('committed')
-    expect(await readFile(join(repo, 'app.txt'), 'utf8')).toBe('base\nevidence\n')
+    expect((await readFile(join(repo, 'app.txt'), 'utf8')).replaceAll('\r\n', '\n')).toBe('base\nevidence\n')
     expect(await readFile(join(repo, 'proof.sh'), 'utf8')).toBe('#!/bin/sh\necho proof')
     expect(portableUntrackedMode((await stat(join(repo, 'proof.sh'))).mode)).toBe(expectedProofMode)
     await expect(service.confirmPromotion(preview.token)).rejects.toThrow('missing or expired')
