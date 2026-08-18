@@ -68,14 +68,15 @@ function builderCommand(candidate: 'direct' | 'evidence'): string {
     `fs.writeFileSync('result.txt',${JSON.stringify(`${candidate}\n`)})`,
     `fs.writeFileSync('dist/index.html',${JSON.stringify(`<!doctype html><main data-arena-candidate>${candidate}</main>\n`)})`,
   ].join(';')
-  return `node -e ${JSON.stringify(script)}`
+  const encoded = Buffer.from(script).toString('base64')
+  return `node -e "eval(Buffer.from('${encoded}','base64').toString('utf8'))"`
 }
 
 async function builderServer(candidate: 'direct' | 'evidence'): Promise<MockLlmServer> {
   const server = await startMockLlmServer({
     sequence: ['tool_call_success', 'success'],
     apiKey: 'fixture-secret',
-    toolName: 'bash',
+    toolName: process.platform === 'win32' ? 'pwsh' : 'bash',
     toolArguments: JSON.stringify({ command: builderCommand(candidate), description: `Create ${candidate} result` }),
     successText: `${candidate} implementation and focused checks completed`,
     chunkDelayMs: 0,
@@ -248,7 +249,7 @@ describe('Arena complete DSH SDK path', () => {
     const completed = await terminalRun(service, admitted.runId)
 
     expect(completed.status, completed.error).toBe('completed')
-    expect(completed.winner).toBeDefined()
+    expect(completed.winner, completed.error).toBeDefined()
     expect(completed.metrics?.usage.totalTokens).toBeGreaterThan(0)
     expect(completed.metrics?.builders).toBe(2)
     expect(completed.metrics?.reviewers).toBe(4)

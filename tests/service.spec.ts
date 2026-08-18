@@ -12,6 +12,7 @@ import type { ConfinedArgv, SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import { Config, resolveConfig, type ResolvedConfig } from '../src/config.ts'
 import { initialRunBudget } from '../src/budget.ts'
+import { portableUntrackedMode } from '../src/git.ts'
 import { resolveArenaPolicy } from '../src/policy.ts'
 import { ManagedProcessRunner } from '../src/process-runner.ts'
 import type { ArenaRuntimeResult, ArenaRuntimeRunner, ArenaRuntimeSpec } from '../src/runtime.ts'
@@ -39,11 +40,12 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return result.stdout
 }
 
-async function repository(label: string): Promise<string> {
+async function repository(label: string, autoCrlf = false): Promise<string> {
   const root = await temporaryDirectory(label)
   await git(root, 'init', '--quiet')
   await git(root, 'config', 'user.name', 'Arena Test')
   await git(root, 'config', 'user.email', 'arena@example.invalid')
+  if (autoCrlf) await git(root, 'config', 'core.autocrlf', 'true')
   await writeFile(join(root, 'app.txt'), 'base\n')
   await git(root, 'add', 'app.txt')
   await git(root, 'commit', '--quiet', '-m', 'base')
@@ -553,7 +555,8 @@ describe('ArenaService over real Git worktrees', () => {
     expect(trackedDiff.diff).toContain('+evidence')
     const untrackedDiff = await service.candidateFileDiff(completed.runId, 'evidence', 'proof.sh')
     expect(untrackedDiff).toMatchObject({ contenderId: 'evidence', truncated: false, file: { path: 'proof.sh', untracked: true } })
-    expect(untrackedDiff.diff).toContain('new file mode 100755')
+    const expectedProofMode = portableUntrackedMode(0o755)
+    expect(untrackedDiff.diff).toContain(`new file mode ${(expectedProofMode & 0o111) === 0 ? '100644' : '100755'}`)
     expect(untrackedDiff.diff).toContain('+echo proof')
 
     const preview = await service.previewPromotion(completed.runId, 'evidence')
@@ -565,7 +568,7 @@ describe('ArenaService over real Git worktrees', () => {
     expect(promoted.promotionTransaction?.phase).toBe('committed')
     expect(await readFile(join(repo, 'app.txt'), 'utf8')).toBe('base\nevidence\n')
     expect(await readFile(join(repo, 'proof.sh'), 'utf8')).toBe('#!/bin/sh\necho proof')
-    expect((await stat(join(repo, 'proof.sh'))).mode & 0o777).toBe(0o755)
+    expect(portableUntrackedMode((await stat(join(repo, 'proof.sh'))).mode)).toBe(expectedProofMode)
     await expect(service.confirmPromotion(preview.token)).rejects.toThrow('missing or expired')
 
     const cleaned = await service.cleanup(completed.runId)
@@ -861,7 +864,7 @@ describe('ArenaService over real Git worktrees', () => {
   })
 
   it('rolls back only exact Arena-owned partial promotion effects after Host restart', async () => {
-    const repo = await repository('promotion-recovery-partial')
+    const repo = await repository('promotion-recovery-partial', true)
     const stateRoot = await temporaryDirectory('promotion-recovery-partial-state')
     const config = testConfig(stateRoot)
     const service = await serviceWith(new EditingRuntime(), stateRoot, ConfiguredCredentials, config)
@@ -881,9 +884,12 @@ describe('ArenaService over real Git worktrees', () => {
 
     const recoveredService = await serviceWith(new NoInvocationRuntime(), stateRoot, ConfiguredCredentials, config)
     const recovered = recoveredService.get(completed.runId)
-    expect(recovered.promotionTransaction?.phase).toBe('rolled-back')
+    expect(
+      recovered.promotionTransaction?.phase,
+      recovered.promotionTransaction?.error,
+    ).toBe('rolled-back')
     expect(recovered.promotion).toBeUndefined()
-    expect(await readFile(join(repo, 'app.txt'), 'utf8')).toBe('base\n')
+    expect((await readFile(join(repo, 'app.txt'), 'utf8')).replaceAll('\r\n', '\n')).toBe('base\n')
     expect(await git(repo, 'status', '--porcelain=v1', '--untracked-files=all')).toBe('')
   })
 
