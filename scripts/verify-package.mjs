@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
+import { parseNpmPackReport } from './npm-pack-report.mjs'
 
 const root = new URL('../', import.meta.url)
 const rootPath = fileURLToPath(root)
@@ -71,7 +72,7 @@ try {
     env: { ...process.env, npm_config_cache: cache },
     maxBuffer: 8 * 1024 * 1024,
   })
-  const report = JSON.parse(stdout)
+  const report = parseNpmPackReport(stdout)
   const files = report?.[0]?.files
   if (!Array.isArray(files)) throw new Error('npm pack did not return a file manifest')
   const packed = new Set(files.map(file => file.path))

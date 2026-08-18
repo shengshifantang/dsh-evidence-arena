@@ -1,10 +1,18 @@
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
+import { canonicalGitPatch, portableUntrackedMode } from '../src/git.ts'
 
 const packageRoot = fileURLToPath(new URL('..', import.meta.url))
 
 describe('Arena Windows runtime composition', () => {
+  it('canonicalizes Git patch framing and synthetic Windows permission bits', () => {
+    expect(canonicalGitPatch('diff --git a/a b/a\r\n+safe\r\n')).toBe('diff --git a/a b/a\n+safe\n')
+    expect(canonicalGitPatch('binary\rpayload\n')).toBe('binary\rpayload\n')
+    expect(portableUntrackedMode(0o100666, 'win32')).toBe(0o600)
+    expect(portableUntrackedMode(0o100755, 'linux')).toBe(0o755)
+  })
+
   it('selects exactly one sandboxed shell family and never gives Reviewers a shell', async () => {
     const runtime = await readFile(`${packageRoot}/runtime/cordis.yml`, 'utf8')
     expect(runtime).toContain("name: '@deepseek-ai/dsh-pwsh-sandbox'")

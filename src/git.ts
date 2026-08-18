@@ -52,6 +52,24 @@ export interface ArenaRepositoryInspection extends ArenaRepository {
   clean: boolean
 }
 
+/** Git writes CRLF-framed command output on Windows even though a patch is a portable text artifact. */
+export function canonicalGitPatch(patch: string): string {
+  return patch.replace(/\r\n/gu, '\n')
+}
+
+/** Windows ACLs cannot be represented by Node's synthetic POSIX mode bits. Store a safe portable mode. */
+export function portableUntrackedMode(mode: number, platform: NodeJS.Platform = process.platform): number {
+  return platform === 'win32' ? 0o600 : mode & 0o777
+}
+
+function patchOutputLimit(maxPatchBytes: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, (maxPatchBytes * 2) + 1)
+}
+
+function sameGitPatch(left: string, right: string): boolean {
+  return canonicalGitPatch(left) === canonicalGitPatch(right)
+}
+
 function errorText(result: ProcessResult): string {
   const detail = (result.stderr.trim() || result.stdout.trim()).slice(-4_000)
   return detail.length === 0 ? `exit ${String(result.exitCode)}${result.signal === null ? '' : ` (${result.signal})`}` : detail
@@ -271,12 +289,12 @@ export class ArenaGit {
       worktreePath,
       ['diff', '--binary', '--no-ext-diff', '--full-index', repo.baseCommit, '--'],
       signal,
-      this.config.maxPatchBytes + 1,
+      patchOutputLimit(this.config.maxPatchBytes),
     )
-    if (patchResult.stdoutTruncated || Buffer.byteLength(patchResult.stdout) > this.config.maxPatchBytes) {
+    const patch = canonicalGitPatch(patchResult.stdout)
+    if (patchResult.stdoutTruncated || Buffer.byteLength(patch) > this.config.maxPatchBytes) {
       throw new Error(`tracked patch exceeds maxPatchBytes (${this.config.maxPatchBytes})`)
     }
-    const patch = patchResult.stdout
     await writeFileAtomic(resolve(artifactDir, 'changes.patch'), patch, { mode: 0o600, dirMode: 0o700 })
 
     const [names, stats, untrackedResult] = await Promise.all([
@@ -328,7 +346,7 @@ export class ArenaGit {
       await mkdir(dirname(target), { recursive: true, mode: 0o700 })
       await copyFile(source, target)
       await chmod(target, 0o600)
-      const mode = info.mode & 0o777
+      const mode = portableUntrackedMode(info.mode)
       untracked.push({ path, size: bytes.byteLength, sha256, mode })
       const binary = bytes.includes(0)
       const text = binary ? '' : bytes.toString('utf8')
@@ -399,9 +417,11 @@ export class ArenaGit {
       repo.root,
       ['diff', '--binary', '--no-ext-diff', '--full-index', repo.baseCommit, '--'],
       signal,
-      this.config.maxPatchBytes + 1,
+      patchOutputLimit(this.config.maxPatchBytes),
     )
-    if (actual.stdout !== expected) throw new Error('applied tracked diff does not match the selected contender evidence')
+    if (!sameGitPatch(actual.stdout, expected)) {
+      throw new Error('applied tracked diff does not match the selected contender evidence')
+    }
   }
 
   /** Verify copied untracked artifacts in the original worktree. */
@@ -489,8 +509,10 @@ export class ArenaGit {
       repo.root,
       ['diff', '--binary', '--no-ext-diff', '--full-index', repo.baseCommit, '--'],
       undefined,
-      this.config.maxPatchBytes + 1,
+      patchOutputLimit(this.config.maxPatchBytes),
     )
+    const trackedPatch = canonicalGitPatch(tracked.stdout)
+    const candidatePatch = canonicalGitPatch(candidate.patch)
     let present = 0
     for (const file of candidate.untracked) {
       const target = repositoryAbsolutePath(repo.root, file.path)
@@ -504,8 +526,8 @@ export class ArenaGit {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       }
     }
-    if (tracked.stdout.length === 0 && present === 0) return 'clean'
-    if (tracked.stdout === candidate.patch && present === candidate.untracked.length) return 'exact'
+    if (trackedPatch.length === 0 && present === 0) return 'clean'
+    if (trackedPatch === candidatePatch && present === candidate.untracked.length) return 'exact'
     return 'partial-or-diverged'
   }
 
@@ -518,9 +540,11 @@ export class ArenaGit {
       repo.root,
       ['diff', '--binary', '--no-ext-diff', '--full-index', repo.baseCommit, '--'],
       undefined,
-      this.config.maxPatchBytes + 1,
+      patchOutputLimit(this.config.maxPatchBytes),
     )
-    if (tracked.stdout.length !== 0 && tracked.stdout !== candidate.patch) {
+    const trackedPatch = canonicalGitPatch(tracked.stdout)
+    const candidatePatch = canonicalGitPatch(candidate.patch)
+    if (trackedPatch.length !== 0 && trackedPatch !== candidatePatch) {
       throw new Error('tracked files diverged from both the clean base and the selected Arena artifact')
     }
     const copied: string[] = []
@@ -539,7 +563,7 @@ export class ArenaGit {
       }
     }
     await this.removeCopied(copied)
-    if (tracked.stdout === candidate.patch) await this.reversePatch(repo.root, candidate.patch)
+    if (trackedPatch === candidatePatch) await this.reversePatch(repo.root, candidate.patch)
     await this.assertOriginalUnchanged(repo)
   }
 
