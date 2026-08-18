@@ -12,6 +12,7 @@ describe('Arena Windows runtime composition', () => {
     expect(runtime).toContain("process.platform !== 'win32' || process.env.DSH_ARENA_ROLE === 'reviewer'")
     expect(runtime).toContain("process.platform === 'win32' || process.env.DSH_ARENA_ROLE === 'reviewer' ? false")
     expect(runtime).toContain('enableRunInBackground: false')
+    expect(runtime).toContain("process.env.DSH_ARENA_ROLE === 'reviewer' ? 'off' : 'max'")
   })
 
   it('declares Loader-resolved PowerShell packages as Host peers and keeps the transitive runtime buildable', async () => {
@@ -20,13 +21,13 @@ describe('Arena Windows runtime composition', () => {
       devDependencies: Record<string, string>
     }
     expect(manifest.peerDependencies).toMatchObject({
-      '@deepseek-ai/dsh-pwsh-sandbox': '^0.1.0-rc.6',
-      '@deepseek-ai/dsh-tool-pwsh': '^0.1.0-rc.6',
+      '@deepseek-ai/dsh-pwsh-sandbox': '^0.1.0-rc.7',
+      '@deepseek-ai/dsh-tool-pwsh': '^0.1.0-rc.7',
     })
     expect(manifest.devDependencies).toMatchObject({
-      '@deepseek-ai/dsh-pwsh-local': '^0.1.0-rc.6',
-      '@deepseek-ai/dsh-pwsh-sandbox': '^0.1.0-rc.6',
-      '@deepseek-ai/dsh-tool-pwsh': '^0.1.0-rc.6',
+      '@deepseek-ai/dsh-pwsh-local': '^0.1.0-rc.7',
+      '@deepseek-ai/dsh-pwsh-sandbox': '^0.1.0-rc.7',
+      '@deepseek-ai/dsh-tool-pwsh': '^0.1.0-rc.7',
     })
   })
 })

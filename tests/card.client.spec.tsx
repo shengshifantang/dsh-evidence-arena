@@ -4,14 +4,21 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { ArenaCard, type ArenaCardProps } from '../src/client/ArenaCard.tsx'
 import { en } from '../src/client/locales.ts'
 import {
+  ARENA_REPORT_VERSION,
   ARENA_STATE_VERSION,
   type ArenaCandidateFileDiff,
+  type ArenaCandidatePreview,
+  type ArenaPortableReport,
   type ArenaPromotionPreview,
   type ArenaRunState,
   type ArenaSetupReport,
 } from '../src/types.ts'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+})
 
 function runState(overrides: Partial<ArenaRunState> = {}): ArenaRunState {
   const now = Date.now()
@@ -136,6 +143,10 @@ function setupReport(): ArenaSetupReport {
       }],
       credentials: [{ ref: 'FIXTURE_API_KEY', configured: true, writable: false, consumers: ['builder:direct'] }],
       reviewCorrelations: [],
+      budget: {
+        limits: { totalTokens: 400_000, modelCalls: 48, wallTimeMs: 1_200_000 },
+        stopAfterApproved: 0, unlimited: [], requiresAcknowledgement: false,
+      },
       policy: {
         source: 'host-config', policyId: 'host-config', revision: 'runtime', digest: 'd'.repeat(64),
         signature: { status: 'ignored' },
@@ -180,17 +191,93 @@ function candidateFileDiff(contenderId = 'evidence'): ArenaCandidateFileDiff {
   }
 }
 
+function portableReport(run: ArenaRunState): ArenaPortableReport {
+  return {
+    schemaVersion: ARENA_REPORT_VERSION,
+    generatedAt: Date.now(),
+    runId: run.runId,
+    task: run.task,
+    baseCommit: run.baseCommit,
+    status: run.status,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    policy: {
+      source: run.policy.source,
+      policyId: run.policy.policyId,
+      revision: run.policy.revision,
+      digest: run.policy.digest,
+      signature: { ...run.policy.signature },
+    },
+    budget: structuredClone(run.budget),
+    contenders: [],
+    privacy: {
+      redactionsApplied: 0,
+      truncationsApplied: 0,
+      reviewBeforeSharing: true,
+      omitted: ['raw evidence'],
+    },
+    limitations: ['One task is not model accuracy.'],
+  }
+}
+
 function props(overrides: Partial<ArenaCardProps> = {}): ArenaCardProps {
   const run = runState()
+  const previewStates = new Map<string, ArenaCandidatePreview['status']>()
+  const candidatePreview = (contenderId: string, status: ArenaCandidatePreview['status']): ArenaCandidatePreview => ({
+    runId: run.runId,
+    contenderId,
+    artifactHash: 'a'.repeat(64),
+    status,
+    ...(status === 'running' ? {
+      launch: { kind: 'static-output' as const, label: 'dist/index.html', argv: ['node', '<arena-static-server>'] },
+      url: 'http://127.0.0.1:43123/', pid: 123, readyAt: Date.now(),
+    } : {}),
+    stdout: status === 'running' ? 'ARENA_PREVIEW_READY' : '',
+    stderr: '',
+    outputTruncated: false,
+    safety: {
+      explicitStartRequired: true, disposableWorktree: true, loopbackRequested: true,
+      networkIsolated: false, hostReadsIsolated: false,
+    },
+  })
   return {
     view: 'run',
     targetId: 'arena-fixture',
     isLoopback: true,
+    addWorkspace: vi.fn(async () => ({ workspaceId: 'workspace-fixture' })),
+    createDemoWorkspace: vi.fn(async () => ({
+      workspaceId: 'workspace-demo', path: '/fixture/demo', template: 'commonjs-sum' as const,
+      createdAt: Date.now(), suggestedTask: 'Fix the demo.',
+    })),
+    setCredential: vi.fn(async () => {}),
     list: vi.fn(async () => []),
     start: vi.fn(async () => ({ run, pollAfterMs: 60_000 })),
     retry: vi.fn(async () => ({ run, pollAfterMs: 60_000 })),
     loadRun: vi.fn(async () => ({ run, pollAfterMs: 60_000 })),
+    loadReport: vi.fn(async () => portableReport(run)),
     loadFileDiff: vi.fn(async (_runId: string, contenderId: string) => candidateFileDiff(contenderId)),
+    loadCandidatePreview: vi.fn(async (_runId: string, contenderId: string) => candidatePreview(contenderId, previewStates.get(contenderId) ?? 'idle')),
+    startCandidatePreview: vi.fn(async (_runId: string, contenderId: string) => {
+      previewStates.set(contenderId, 'running')
+      return candidatePreview(contenderId, 'running')
+    }),
+    stopCandidatePreview: vi.fn(async (_runId: string, contenderId: string) => {
+      previewStates.set(contenderId, 'stopped')
+      return candidatePreview(contenderId, 'stopped')
+    }),
+    recordHumanEvaluation: vi.fn(async (_runId: string, contenderId: string, verdict: 'passed' | 'failed' | 'inconclusive', note?: string) => {
+      const next = structuredClone(run)
+      const contender = next.contenders.find(item => item.id === contenderId)!
+      contender.humanEvaluation = {
+        artifactHash: contender.evidence!.patchHash,
+        verdict,
+        ...note === undefined ? {} : { note },
+        recordedAt: Date.now(),
+        previewReadyAt: Date.now(),
+        source: 'loopback-user-attestation',
+      }
+      return { run: next, pollAfterMs: 60_000 }
+    }),
     loadSetup: vi.fn(async () => setupReport()),
     writePolicy: vi.fn(async () => ({ ...setupReport(), preflight: { ...setupReport().preflight, ready: true, blockers: [] } })),
     cancel: vi.fn(async () => ({ run: runState({ status: 'cancelled' }), pollAfterMs: 60_000 })),
@@ -231,9 +318,14 @@ describe('ArenaCard', () => {
     render(<ArenaCard {...card} />)
 
     expect(await screen.findByText('Implement a verified answer')).toBeTruthy()
-    expect(screen.getAllByText('Direct Builder')).toHaveLength(2)
-    expect(screen.getAllByText('Evidence Builder')).toHaveLength(2)
+    expect(screen.getAllByText('Direct Builder')).toHaveLength(3)
+    expect(screen.getAllByText('Evidence Builder')).toHaveLength(3)
     expect(screen.getAllByText('Mechanical leader (ranking only)')).toHaveLength(2)
+    expect(screen.getByRole('region', { name: 'Comparison summary' })).toBeTruthy()
+    expect(screen.getByText('Fastest')).toBeTruthy()
+    expect(screen.getAllByText('Lowest token use')).toHaveLength(2)
+    expect(screen.getAllByText('Smallest change')).toHaveLength(2)
+    expect(screen.getByText(/It is not cross-task model accuracy/iu)).toBeTruthy()
     const previewButtons = screen.getAllByRole('button', { name: 'Prepare promotion' })
     fireEvent.click(previewButtons[1]!)
 
@@ -255,6 +347,65 @@ describe('ArenaCard', () => {
     expect(await screen.findByText('+export const answer = 42')).toBeTruthy()
     expect(screen.getByText('-export const answer = 41')).toBeTruthy()
     expect(card.loadFileDiff).toHaveBeenCalledWith('arena-fixture', 'evidence', 'src/answer.ts')
+  })
+
+  it('downloads a portable JSON report without requiring loopback control authority', async () => {
+    const nativeURL = URL
+    const createObjectURL = vi.fn(() => 'blob:arena-report')
+    const revokeObjectURL = vi.fn()
+    class URLWithBlob extends nativeURL {}
+    Object.defineProperties(URLWithBlob, {
+      createObjectURL: { configurable: true, value: createObjectURL },
+      revokeObjectURL: { configurable: true, value: revokeObjectURL },
+    })
+    vi.stubGlobal('URL', URLWithBlob)
+    let download = ''
+    let href = ''
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      download = this.download
+      href = this.href
+    })
+    const card = props({ isLoopback: false })
+    render(<ArenaCard {...card} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Download evidence report' }))
+
+    await waitFor(() => { expect(card.loadReport).toHaveBeenCalledWith('arena-fixture') })
+    expect(download).toBe('evidence-arena-arena-fixture.json')
+    expect(href).toBe('blob:arena-report')
+    expect(createObjectURL).toHaveBeenCalledOnce()
+    expect(createObjectURL.mock.calls[0]?.[0]).toBeInstanceOf(Blob)
+    expect((createObjectURL.mock.calls[0]?.[0] as Blob).type).toBe('application/json;charset=utf-8')
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:arena-report')
+    expect(await screen.findByText(/privacy-bounded evaluation report was downloaded/iu)).toBeTruthy()
+  })
+
+  it('keeps candidate execution collapsed until explicitly opened, then exposes link, logs, and stop', async () => {
+    const card = props()
+    render(<ArenaCard {...card} />)
+    await screen.findByText('Implement a verified answer')
+    expect(card.loadCandidatePreview).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getAllByRole('button', { name: /Run candidate result/u })[0]!)
+    await waitFor(() => { expect(card.loadCandidatePreview).toHaveBeenCalledWith('arena-fixture', 'direct') })
+    fireEvent.click(screen.getByRole('checkbox'))
+    fireEvent.click(screen.getByRole('button', { name: 'Start and test this result' }))
+
+    const link = await screen.findByRole('link', { name: /Open candidate frontend/u })
+    expect(link.getAttribute('href')).toBe('http://127.0.0.1:43123/')
+    expect(card.startCandidatePreview).toHaveBeenCalledWith('arena-fixture', 'direct')
+    fireEvent.change(screen.getByLabelText('Test verdict'), { target: { value: 'passed' } })
+    fireEvent.change(screen.getByLabelText('Test note (optional)'), { target: { value: 'Login and save work.' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save human verdict' }))
+    await waitFor(() => {
+      expect(card.recordHumanEvaluation).toHaveBeenCalledWith(
+        'arena-fixture', 'direct', 'passed', 'Login and save work.',
+      )
+    })
+    expect(await screen.findAllByText('Human test passed')).toHaveLength(2)
+    expect(screen.getAllByText('Login and save work.')).toHaveLength(2)
+    fireEvent.click(screen.getByRole('button', { name: 'Stop and clean up' }))
+    await waitFor(() => { expect(card.stopCandidatePreview).toHaveBeenCalledWith('arena-fixture', 'direct') })
   })
 
   it('keeps the confirmation visible when promotion fails and disables controls remotely', async () => {
@@ -302,6 +453,41 @@ describe('ArenaCard', () => {
       expect(card.writePolicy).toHaveBeenCalledWith('workspace-fixture', '{"schemaVersion":1}')
     })
     expect(await screen.findByText(/The policy was written atomically and preflight was rerun\./u)).toBeTruthy()
+  })
+
+  it('writes a missing key through Harness credentials and never keeps the secret in the setup UI', async () => {
+    const missing = setupReport()
+    missing.preflight.credentials = [{
+      ref: 'FIXTURE_API_KEY', configured: false, writable: true, consumers: ['builder:direct'],
+    }]
+    missing.preflight.blockers = ['credential FIXTURE_API_KEY is not configured']
+    missing.preflight.remediations = [{
+      id: 'credential:FIXTURE_API_KEY', severity: 'blocker', title: 'Configure FIXTURE_API_KEY',
+      detail: 'Use the secure field.', action: 'configure-credential',
+    }]
+    const ready = setupReport()
+    ready.preflight.ready = true
+    ready.preflight.blockers = []
+    ready.preflight.credentials = [{
+      ref: 'FIXTURE_API_KEY', configured: true, writable: true, consumers: ['builder:direct'],
+    }]
+    ready.preflight.remediations = []
+    const loadSetup = vi.fn().mockResolvedValueOnce(missing).mockResolvedValue(ready)
+    const setCredential = vi.fn(async () => {})
+
+    render(<ArenaCard {...props({ view: 'setup', targetId: 'workspace-fixture', loadSetup, setCredential })} />)
+    const input = await screen.findByLabelText('Credential value FIXTURE_API_KEY')
+    fireEvent.change(input, { target: { value: 'test-secret-that-must-disappear' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save securely' }))
+
+    await waitFor(() => {
+      expect(setCredential).toHaveBeenCalledWith('FIXTURE_API_KEY', 'test-secret-that-must-disappear')
+      expect(loadSetup).toHaveBeenCalledTimes(2)
+    })
+    expect((await screen.findByRole('status')).textContent)
+      .toContain('The credential was written to Harness and preflight was rerun.')
+    expect(screen.queryByDisplayValue('test-secret-that-must-disappear')).toBeNull()
+    expect(document.body.textContent).not.toContain('test-secret-that-must-disappear')
   })
 
   it('retries a failed workspace setup read on demand', async () => {

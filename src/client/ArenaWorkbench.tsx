@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { InjectFace, PropsLocale, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
-import { isActiveArenaStatus, type ArenaRunSummary } from '../types.ts'
+import { isActiveArenaStatus, type ArenaRunSummary, type ArenaSetupReport } from '../types.ts'
 import { ArenaCard } from './ArenaCard.tsx'
 import type { ArenaCardFace } from './rpc.ts'
 import type { ArenaWorkbenchStore } from './stores.ts'
@@ -23,17 +23,31 @@ function formatTokens(value: number | undefined): string {
   return new Intl.NumberFormat(undefined, { notation: value >= 10_000 ? 'compact' : 'standard' }).format(value)
 }
 
+function formatDuration(milliseconds: number): string {
+  const minutes = Math.floor(milliseconds / 60_000)
+  const seconds = Math.round((milliseconds % 60_000) / 1_000)
+  return minutes === 0 ? `${seconds}s` : `${minutes}m ${seconds}s`
+}
+
 /** Render only while the shared root store is open; no chat Session is required. */
 export function ArenaWorkbench({
   useWorkspaces,
   useStore,
   actions,
   isLoopback,
+  addWorkspace,
+  createDemoWorkspace,
+  setCredential,
   list,
   start,
   retry,
   loadRun,
+  loadReport,
   loadFileDiff,
+  loadCandidatePreview,
+  startCandidatePreview,
+  stopCandidatePreview,
+  recordHumanEvaluation,
   loadSetup,
   writePolicy,
   cancel,
@@ -52,12 +66,20 @@ export function ArenaWorkbench({
   const [task, setTask] = useState('')
   const [runs, setRuns] = useState<readonly ArenaRunSummary[]>([])
   const [busy, setBusy] = useState<'start' | 'retry'>()
-  const [error, setError] = useState<string>()
+  const [workspaceBusy, setWorkspaceBusy] = useState<'pick' | 'demo'>()
+  const [actionError, setActionError] = useState<string>()
+  const [actionNotice, setActionNotice] = useState<string>()
+  const [refreshError, setRefreshError] = useState<string>()
+  const [launchSetup, setLaunchSetup] = useState<ArenaSetupReport>()
+  const [launchSetupError, setLaunchSetupError] = useState<string>()
+  const [unlimitedBudgetAcknowledged, setUnlimitedBudgetAcknowledged] = useState(false)
 
   const face: ArenaCardFace = useMemo(() => ({
-    isLoopback, list, start, retry, loadRun, loadFileDiff, loadSetup, writePolicy,
+    isLoopback, addWorkspace, createDemoWorkspace, setCredential, list, start, retry, loadRun, loadReport, loadFileDiff, loadCandidatePreview,
+    startCandidatePreview, stopCandidatePreview, recordHumanEvaluation, loadSetup, writePolicy,
     cancel, cleanup, preview, confirm,
-  }), [cancel, cleanup, confirm, isLoopback, list, loadFileDiff, loadRun, loadSetup, preview, retry, start, writePolicy])
+  }), [addWorkspace, cancel, cleanup, confirm, createDemoWorkspace, isLoopback, list, loadCandidatePreview, loadFileDiff, loadReport,
+    loadRun, loadSetup, preview, recordHumanEvaluation, retry, setCredential, start, startCandidatePreview, stopCandidatePreview, writePolicy])
 
   useEffect(() => {
     if (!open) return
@@ -66,13 +88,27 @@ export function ArenaWorkbench({
     actions.selectWorkspace(fallback === undefined ? null : String(fallback.workspaceId))
   }, [actions, open, recentWorkspaceId, workspaceId, workspaces])
 
+  useEffect(() => {
+    setUnlimitedBudgetAcknowledged(false)
+    setLaunchSetup(undefined)
+    setLaunchSetupError(undefined)
+    if (!open || workspaceId === null) return
+    let disposed = false
+    void loadSetup(workspaceId).then((next) => {
+      if (!disposed) setLaunchSetup(next)
+    }).catch((reason: unknown) => {
+      if (!disposed) setLaunchSetupError(reason instanceof Error ? reason.message : String(reason))
+    })
+    return () => { disposed = true }
+  }, [loadSetup, open, workspaceId])
+
   const refreshRuns = useCallback(async (): Promise<void> => {
     try {
       const next = await list()
       setRuns(next)
-      setError(undefined)
+      setRefreshError(undefined)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      setRefreshError(reason instanceof Error ? reason.message : String(reason))
     }
   }, [list])
 
@@ -113,37 +149,94 @@ export function ArenaWorkbench({
   const startRun = async (): Promise<void> => {
     if (workspaceId === null || task.trim().length === 0 || busy !== undefined) return
     setBusy('start')
-    setError(undefined)
+    setActionError(undefined)
+    setActionNotice(undefined)
     try {
-      const response = await start(workspaceId, task)
-      actions.selectRun(response.run.runId)
+      const setup = await loadSetup(workspaceId)
+      setLaunchSetup(setup)
+      if (!setup.preflight.ready) {
+        actions.showView('setup')
+        setActionError(t('workbench.preflightRequired'))
+        return
+      }
+      if (setup.preflight.budget.requiresAcknowledgement && !unlimitedBudgetAcknowledged) {
+        setActionError(t('workbench.unlimitedBudgetRequired'))
+        return
+      }
+      const response = await start(workspaceId, task, { acknowledgeUnlimitedBudget: unlimitedBudgetAcknowledged })
       actions.showView('runs')
       setTask('')
+      setUnlimitedBudgetAcknowledged(false)
       await refreshRuns()
+      // Keep the fallback-selection effect from seeing a run id that is not
+      // present in the local history snapshot yet and reverting to the old run.
+      actions.selectRun(response.run.runId)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      setActionError(reason instanceof Error ? reason.message : String(reason))
     } finally {
       setBusy(undefined)
+    }
+  }
+
+  const addProject = async (mode: 'pick' | 'demo'): Promise<void> => {
+    if (!isLoopback || workspaceBusy !== undefined) return
+    setWorkspaceBusy(mode)
+    setActionError(undefined)
+    setActionNotice(undefined)
+    try {
+      if (mode === 'demo') {
+        const result = await createDemoWorkspace()
+        actions.selectWorkspace(result.workspaceId)
+        actions.showView('runs')
+        setTask(result.suggestedTask)
+        setActionNotice(t('workbench.demoCreated'))
+      } else {
+        const result = await addWorkspace()
+        if (result === undefined) return
+        actions.selectWorkspace(result.workspaceId)
+        actions.showView('runs')
+        setActionNotice(t('workbench.workspaceAdded'))
+      }
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setWorkspaceBusy(undefined)
     }
   }
 
   const retryRun = async (): Promise<void> => {
     if (selectedRunId === null || busy !== undefined) return
     setBusy('retry')
-    setError(undefined)
+    setActionError(undefined)
     try {
-      const response = await retry(selectedRunId)
-      actions.selectRun(response.run.runId)
+      if (workspaceId === null) return
+      const setup = await loadSetup(workspaceId)
+      setLaunchSetup(setup)
+      if (!setup.preflight.ready) {
+        actions.showView('setup')
+        setActionError(t('workbench.preflightRequired'))
+        return
+      }
+      if (setup.preflight.budget.requiresAcknowledgement && !unlimitedBudgetAcknowledged) {
+        setActionError(t('workbench.unlimitedBudgetRequired'))
+        return
+      }
+      const response = await retry(selectedRunId, { acknowledgeUnlimitedBudget: unlimitedBudgetAcknowledged })
       actions.showView('runs')
+      setUnlimitedBudgetAcknowledged(false)
       await refreshRuns()
+      actions.selectRun(response.run.runId)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      setActionError(reason instanceof Error ? reason.message : String(reason))
     } finally {
       setBusy(undefined)
     }
   }
 
   if (!open) return null
+
+  const budgetPolicy = launchSetup?.preflight.budget
+  const unlimitedBudgetBlocked = budgetPolicy?.requiresAcknowledgement === true && !unlimitedBudgetAcknowledged
 
   return (
     <div className={css.overlay} role="presentation" onMouseDown={(event) => {
@@ -155,17 +248,27 @@ export function ArenaWorkbench({
             <span className={css.brandMark} aria-hidden>A/B</span>
             <div><h2>{t('workbench.title')}</h2><p>{t('workbench.subtitle')}</p></div>
           </div>
-          <label className={css.workspacePicker}>
-            <span>{t('workbench.workspace')}</span>
-            <select
-              value={workspaceId ?? ''}
-              disabled={!baselinesReady || workspaces.length === 0}
-              onChange={(event) => { actions.selectWorkspace(event.currentTarget.value || null) }}
-            >
-              {workspaces.length === 0 && <option value="">{t('workbench.noWorkspace')}</option>}
-              {workspaces.map(item => <option key={String(item.workspaceId)} value={String(item.workspaceId)}>{item.title}</option>)}
-            </select>
-          </label>
+          <div className={css.workspaceControls}>
+            <label className={css.workspacePicker}>
+              <span>{t('workbench.workspace')}</span>
+              <select
+                value={workspaceId ?? ''}
+                disabled={!baselinesReady || workspaces.length === 0 || workspaceBusy !== undefined}
+                onChange={(event) => { actions.selectWorkspace(event.currentTarget.value || null) }}
+              >
+                {workspaces.length === 0 && <option value="">{t('workbench.noWorkspace')}</option>}
+                {workspaces.map(item => <option key={String(item.workspaceId)} value={String(item.workspaceId)}>{item.title}</option>)}
+              </select>
+            </label>
+            <button type="button" className={css.addWorkspaceButton} disabled={!isLoopback || workspaceBusy !== undefined} onClick={() => { void addProject('pick') }}>
+              {workspaceBusy === 'pick' ? t('workbench.addingWorkspace') : t('workbench.addWorkspace')}
+            </button>
+            {workspaceId !== null && (
+              <button type="button" className={css.addWorkspaceButton} data-demo disabled={!isLoopback || workspaceBusy !== undefined} onClick={() => { void addProject('demo') }}>
+                {workspaceBusy === 'demo' ? t('workbench.creatingDemo') : t('workbench.createDemo')}
+              </button>
+            )}
+          </div>
           <button type="button" className={css.closeButton} aria-label={t('workbench.close')} onClick={() => { actions.setOpen(false) }}>×</button>
         </header>
 
@@ -174,11 +277,27 @@ export function ArenaWorkbench({
           <button type="button" data-selected={view === 'setup' || undefined} onClick={() => { actions.showView('setup') }}>{t('workbench.setup')}</button>
         </nav>
 
-        {error !== undefined && <div className={css.error} role="alert">{error}</div>}
+        {(actionError ?? refreshError) !== undefined && (
+          <div className={css.error} role="alert">{actionError ?? refreshError}</div>
+        )}
+        {actionNotice !== undefined && <div className={css.success} role="status">✓ {actionNotice}</div>}
         {!isLoopback && <div className={css.readOnly}>{t('remoteReadOnly')}</div>}
 
         {workspaceId === null ? (
-          <div className={css.emptyState}>{t('workbench.selectWorkspace')}</div>
+          <div className={css.onboarding}>
+            <div className={css.onboardingMark} aria-hidden>A/B</div>
+            <h3>{t('workbench.onboardingTitle')}</h3>
+            <p>{t('workbench.onboardingBody')}</p>
+            <div className={css.onboardingActions}>
+              <button type="button" disabled={!isLoopback || workspaceBusy !== undefined} onClick={() => { void addProject('pick') }}>
+                {workspaceBusy === 'pick' ? t('workbench.addingWorkspace') : t('workbench.chooseProject')}
+              </button>
+              <button type="button" data-primary disabled={!isLoopback || workspaceBusy !== undefined} onClick={() => { void addProject('demo') }}>
+                {workspaceBusy === 'demo' ? t('workbench.creatingDemo') : t('workbench.createDemo')}
+              </button>
+            </div>
+            <small>{t('workbench.onboardingNoCli')}</small>
+          </div>
         ) : view === 'setup' ? (
           <main className={css.setupView}>
             <ArenaCard view="setup" targetId={workspaceId} {...face} t={t} />
@@ -195,7 +314,24 @@ export function ArenaWorkbench({
                   placeholder={t('workbench.taskPlaceholder')}
                   onChange={(event) => { setTask(event.currentTarget.value) }}
                 />
-                <button type="submit" disabled={!isLoopback || busy !== undefined || task.trim().length === 0}>
+                <section className={css.budgetPolicy} data-unlimited={budgetPolicy?.requiresAcknowledgement || undefined}>
+                  <header><strong>{t('workbench.budget')}</strong><span>{launchSetup === undefined ? t('workbench.budgetLoading') : t('workbench.budgetEnforced')}</span></header>
+                  {budgetPolicy !== undefined && <dl>
+                    <div><dt>{t('metric.tokens')}</dt><dd>{budgetPolicy.limits.totalTokens === 0 ? t('budget.unlimited') : formatTokens(budgetPolicy.limits.totalTokens)}</dd></div>
+                    <div><dt>{t('metric.calls')}</dt><dd>{budgetPolicy.limits.modelCalls === 0 ? t('budget.unlimited') : budgetPolicy.limits.modelCalls}</dd></div>
+                    <div><dt>{t('metric.duration')}</dt><dd>{formatDuration(budgetPolicy.limits.wallTimeMs)}</dd></div>
+                  </dl>}
+                  {launchSetupError !== undefined && <p className={css.budgetError}>{launchSetupError}</p>}
+                  {budgetPolicy?.requiresAcknowledgement === true && <label className={css.budgetAcknowledgement}>
+                    <input
+                      type="checkbox"
+                      checked={unlimitedBudgetAcknowledged}
+                      onChange={(event) => { setUnlimitedBudgetAcknowledged(event.currentTarget.checked) }}
+                    />
+                    <span>{t('workbench.unlimitedBudgetAcknowledge')}</span>
+                  </label>}
+                </section>
+                <button type="submit" disabled={!isLoopback || busy !== undefined || task.trim().length === 0 || launchSetup === undefined || unlimitedBudgetBlocked}>
                   {busy === 'start' ? t('workbench.starting') : t('workbench.start')}
                 </button>
               </form>
@@ -221,7 +357,7 @@ export function ArenaWorkbench({
                 ? <div className={css.emptyState}>{t('workbench.noRuns')}</div>
                 : <>
                     <div className={css.detailActions}>
-                      <button type="button" disabled={!isLoopback || busy !== undefined} onClick={() => { void retryRun() }}>
+                      <button type="button" disabled={!isLoopback || busy !== undefined || launchSetup === undefined || unlimitedBudgetBlocked} onClick={() => { void retryRun() }}>
                         {busy === 'retry' ? t('workbench.retrying') : t('workbench.retry')}
                       </button>
                     </div>

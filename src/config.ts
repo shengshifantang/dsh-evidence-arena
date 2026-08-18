@@ -85,6 +85,8 @@ export interface Config {
   maxUntrackedBytes: number
   /** Maximum stored child final-response characters. */
   maxFinalResponseChars: number
+  /** Output-token cap for the single automatic reviewer JSON-finalization turn. */
+  reviewRepairMaxTokens: number
   /** Maximum stored unified-diff preview characters. */
   maxDiffPreviewChars: number
   /** Maximum recent activity rows retained per agent. */
@@ -97,6 +99,8 @@ export interface Config {
   terminalPollMs: number
   /** Promotion confirmation-token lifetime. */
   promotionPreviewTtlMs: number
+  /** Deadline for a user-started candidate preview to become reachable on loopback. */
+  previewStartupTimeoutMs: number
   /** Optional override for the child runtime Cordis configuration. */
   runtimeConfig: string
   /** Additional non-secret child environment entries. Arena-owned DSH_* values win. */
@@ -167,6 +171,10 @@ const DEFAULT_PROTECTED_PATH_PATTERNS = [
   '(^|/)credentials(?:\\.|$)',
 ]
 
+/** Safe product defaults: roomy enough for the validated small run, bounded before runaway spend. */
+export const DEFAULT_MAX_RUN_TOKENS = 400_000
+export const DEFAULT_MAX_RUN_MODEL_CALLS = 48
+
 const AgentRouteFields = {
   provider: z.string().default('deepseek-official'),
   model: z.string().default('deepseek-v4-flash'),
@@ -233,7 +241,7 @@ export const Config: z<Config> = z.object({
   policyTrustedKeys: z.dict(z.string()).default({}),
   policyPackMaxBytes: z.number().default(262_144),
   requireChanges: z.boolean().default(true),
-  requireProjectTests: z.boolean().default(true),
+  requireProjectTests: z.boolean().default(false),
   requireLogicReview: z.boolean().default(true),
   requireSecurityReview: z.boolean().default(true),
   reviewerIndependence: z.union(['off', 'warn', 'require'] as const).default('warn'),
@@ -248,8 +256,8 @@ export const Config: z<Config> = z.object({
   maxSharedContextFiles: z.number().default(4_000),
   maxConcurrentRuns: z.number().default(2),
   runTimeoutMs: z.number().default(1_200_000),
-  maxRunTokens: z.number().default(0),
-  maxRunModelCalls: z.number().default(0),
+  maxRunTokens: z.number().default(DEFAULT_MAX_RUN_TOKENS),
+  maxRunModelCalls: z.number().default(DEFAULT_MAX_RUN_MODEL_CALLS),
   stopAfterApproved: z.number().default(0),
   maxTaskChars: z.number().default(20_000),
   processGraceMs: z.number().default(3_000),
@@ -257,12 +265,14 @@ export const Config: z<Config> = z.object({
   maxPatchBytes: z.number().default(8_388_608),
   maxUntrackedBytes: z.number().default(16_777_216),
   maxFinalResponseChars: z.number().default(60_000),
+  reviewRepairMaxTokens: z.number().default(4_096),
   maxDiffPreviewChars: z.number().default(30_000),
   activityLimit: z.number().default(48),
   progressFlushMs: z.number().default(750),
   activePollMs: z.number().default(1_000),
   terminalPollMs: z.number().default(5_000),
   promotionPreviewTtlMs: z.number().default(120_000),
+  previewStartupTimeoutMs: z.number().default(30_000),
   runtimeConfig: z.string().default(''),
   runtimeEnv: z.dict(z.string()).default({}),
 })
@@ -278,7 +288,7 @@ export interface ResolvedConfig extends Omit<Config, 'stateRoot' | 'runtimeConfi
 const ID_PATTERN = /^[a-z][a-z0-9-]{0,31}$/u
 const ENV_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u
 const SENSITIVE_ENV_PATTERN = /KEY|PASSWORD|SECRET|TOKEN/i
-const RESERVED_RUNTIME_ENV = /^(?:DSH_(?:CORDIS_CONFIG|CWD|SESSION_ROOT|SYSTEM_PROMPT|PERMISSION_MODE)|DSH_ARENA_)/iu
+const RESERVED_RUNTIME_ENV = /^(?:DSH_(?:HOME|AGENTS_HOME|CORDIS_CONFIG|CWD|SESSION_ROOT|SYSTEM_PROMPT|PERMISSION_MODE)|DSH_ARENA_)/iu
 
 function positiveSafeInteger(label: string, value: number): void {
   if (!Number.isSafeInteger(value) || value <= 0) {
@@ -411,8 +421,9 @@ export function resolveConfig(config: Config): ResolvedConfig {
     'policyPackMaxBytes', 'maxChangedFiles', 'maxReviewInputChars', 'maxSharedContextBytes',
     'maxSharedContextFiles', 'maxConcurrentRuns', 'runTimeoutMs', 'maxTaskChars',
     'processGraceMs', 'maxOutputBytes', 'maxPatchBytes', 'maxUntrackedBytes', 'maxFinalResponseChars',
+    'reviewRepairMaxTokens',
     'maxDiffPreviewChars', 'activityLimit', 'progressFlushMs', 'activePollMs', 'terminalPollMs',
-    'promotionPreviewTtlMs',
+    'promotionPreviewTtlMs', 'previewStartupTimeoutMs',
   ] as const) positiveSafeInteger(field, config[field])
   if (config.runTimeoutMs > 2_147_483_647) {
     throw new TypeError('dsh-arena runTimeoutMs must not exceed the portable Node.js timer limit (2147483647)')

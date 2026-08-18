@@ -1,16 +1,19 @@
 /** Evidence Arena orchestration: admission, isolated builders, staged gates, reviews, and promotion. */
 
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, rm } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { credentialRef, type CredentialProvider } from '@deepseek-ai/dsh-credentials'
-import type { ResolvedConfig } from './config.ts'
+import { hostProjectPolicy, type ResolvedConfig } from './config.ts'
 import {
   ArenaBudgetExceededError,
   ArenaEarlyStopError,
+  assertBudgetAcknowledged,
+  configuredBudgetPolicy,
   currentBudgetExhaustion,
   initialRunBudget,
   refreshRunBudget,
+  unlimitedBudgetKinds,
 } from './budget.ts'
 import { buildSharedContext } from './context-cache.ts'
 import { boundFileDiff, trackedFilePatch, untrackedFilePatch } from './diff-artifact.ts'
@@ -20,7 +23,8 @@ import {
   type ArenaUntrackedArtifact,
   type CapturedCandidate,
 } from './git.ts'
-import type { ManagedProcessRunner, ProcessResult } from './process-runner.ts'
+import type { ManagedProcessHandle, ManagedProcessRunner, ProcessResult } from './process-runner.ts'
+import { reserveLoopbackPort, selectCandidatePreviewLaunch, waitForCandidatePreview } from './preview.ts'
 import type { ArenaRuntimeRunner, ArenaRuntimeSpec } from './runtime.ts'
 import { resolveArenaPolicy, writeArenaPolicy } from './policy.ts'
 import { assertRepositoryContainment, normalizeRepositoryPath, repositoryAbsolutePath } from './repository-path.ts'
@@ -31,18 +35,28 @@ import {
 } from './security.ts'
 import { ArenaStore, type ArenaRunRecord } from './store.ts'
 import {
+  ARENA_REPORT_VERSION,
+  ARENA_POLICY_VERSION,
   ARENA_STATE_VERSION,
   isActiveArenaStatus,
   zeroTokenUsage,
   type ArenaApprovalDecision,
   type ArenaCandidateFileDiff,
+  type ArenaCandidatePreview,
+  type ArenaDemoProject,
   type ArenaCheckResult,
   type ArenaContenderState,
   type ArenaEvidence,
   type ArenaGateStage,
+  type ArenaHumanEvaluation,
   type ArenaModelIdentity,
   type ArenaPreflight,
   type ArenaPreflightRemediation,
+  type ArenaPortableCheck,
+  type ArenaPortableContender,
+  type ArenaPortableProgress,
+  type ArenaPortableReport,
+  type ArenaPortableReview,
   type ArenaProjectPolicyRules,
   type ArenaProgress,
   type ArenaPromotionPreview,
@@ -63,6 +77,8 @@ export interface ArenaStartRequest {
   task: string
   workspaceId: string
   cwd: string
+  /** Required on every admission when a paid-usage limit is explicitly disabled. */
+  acknowledgeUnlimitedBudget?: boolean
   signal?: AbortSignal
 }
 
@@ -85,8 +101,28 @@ interface ParsedReview {
   findings: ArenaSecurityFinding[]
 }
 
+interface CandidatePreviewSession {
+  state: ArenaCandidatePreview
+  worktreePath: string
+  handle?: ManagedProcessHandle
+  stopping: boolean
+}
+
+class ReviewOutputError extends Error {
+  constructor(
+    readonly code: 'output-exhausted' | 'invalid-output',
+    message: string,
+    readonly response: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options)
+    this.name = 'ReviewOutputError'
+  }
+}
+
 const STAGES: readonly ArenaGateStage[] = ['integrity', 'quality', 'test', 'logic', 'security']
 const BUILDER_SYSTEM_PROMPT = 'You are an isolated coding Builder in Evidence Arena. Treat shared repository context as evidence, obey repository instructions, implement the task in the assigned workspace, and verify the result.'
+const DEMO_TASK = '修复当前 CommonJS 项目中的 sum.js：导出 sum(values)。values 必须是数组；每一项必须是有限的 number，否则抛出 TypeError；空数组返回 0；求和不得修改输入。不要安装依赖。运行 npm test 验证。只修改完成任务所需文件。'
 
 interface RunControl {
   root: AbortController
@@ -139,6 +175,20 @@ function addUsage(target: ArenaTokenUsage, usage: ArenaTokenUsage): void {
   target.cacheWriteTokens += usage.cacheWriteTokens
   target.reasoningTokens += usage.reasoningTokens
   target.totalTokens += usage.totalTokens
+}
+
+function mergedProgress(base: ArenaProgress, current: ArenaProgress, activityLimit: number): ArenaProgress {
+  const usage = structuredClone(base.usage)
+  addUsage(usage, current.usage)
+  return {
+    notifications: base.notifications + current.notifications,
+    events: base.events + current.events,
+    toolCalls: base.toolCalls + current.toolCalls,
+    modelCalls: base.modelCalls + current.modelCalls,
+    usage,
+    ...((current.lastEvent ?? base.lastEvent) === undefined ? {} : { lastEvent: current.lastEvent ?? base.lastEvent }),
+    activity: [...base.activity, ...current.activity].slice(-activityLimit),
+  }
 }
 
 function checkFromProcess(
@@ -261,22 +311,58 @@ function parsedFinding(value: unknown): ArenaSecurityFinding | undefined {
 function parseReviewResponse(value: string): ParsedReview {
   let parsed: unknown
   try { parsed = JSON.parse(stripJsonFence(value)) } catch (error) {
-    throw new Error('reviewer did not return one valid JSON object', { cause: error })
+    throw new ReviewOutputError('invalid-output', 'reviewer did not return one valid JSON object', value, { cause: error })
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new Error('reviewer JSON must be an object')
+    throw new ReviewOutputError('invalid-output', 'reviewer JSON must be an object', value)
   }
   const source = parsed as Record<string, unknown>
   if (source.verdict !== 'approve' && source.verdict !== 'reject') {
-    throw new Error('reviewer JSON verdict must be "approve" or "reject"')
+    throw new ReviewOutputError('invalid-output', 'reviewer JSON verdict must be "approve" or "reject"', value)
   }
   if (typeof source.summary !== 'string' || source.summary.trim().length === 0) {
-    throw new Error('reviewer JSON summary must be a non-empty string')
+    throw new ReviewOutputError('invalid-output', 'reviewer JSON summary must be a non-empty string', value)
   }
-  if (!Array.isArray(source.findings)) throw new Error('reviewer JSON findings must be an array')
+  if (!Array.isArray(source.findings)) {
+    throw new ReviewOutputError('invalid-output', 'reviewer JSON findings must be an array', value)
+  }
   const findings = source.findings.map(parsedFinding)
-  if (findings.some(item => item === undefined)) throw new Error('reviewer JSON contains an invalid finding')
+  if (findings.some(item => item === undefined)) {
+    throw new ReviewOutputError('invalid-output', 'reviewer JSON contains an invalid finding', value)
+  }
   return { verdict: source.verdict, summary: source.summary.slice(0, 4_000), findings: findings as ArenaSecurityFinding[] }
+}
+
+function parseReviewResult(
+  value: string,
+  usage: ArenaTokenUsage,
+  maxTokens: number | undefined,
+): ParsedReview {
+  try {
+    return parseReviewResponse(value)
+  } catch (error) {
+    if (error instanceof ReviewOutputError
+      && maxTokens !== undefined
+      && usage.outputTokens >= maxTokens) {
+      throw new ReviewOutputError(
+        'output-exhausted',
+        `reviewer exhausted its ${maxTokens} output-token budget before returning valid final JSON`,
+        value,
+        { cause: error },
+      )
+    }
+    throw error
+  }
+}
+
+function reviewRepairPrompt(error: ReviewOutputError): string {
+  return [
+    `Your previous review response was unusable (${error.code}).`,
+    'Review the same sealed evidence bundle above without calling tools or producing extended analysis.',
+    'Return ONLY one compact JSON object now. If the evidence is insufficient, use verdict "reject".',
+    '{"verdict":"approve|reject","summary":"short evidence-based conclusion","findings":[{"ruleId":"short-id","severity":"critical|high|medium|low","path":"file or <review>","line":1,"message":"actionable finding"}]}',
+    'No markdown, preamble, or reasoning outside the JSON object.',
+  ].join('\n')
 }
 
 function builderPrompt(options: {
@@ -401,10 +487,22 @@ function decideApproval(
       || stage === 'security' && config.requireSecurityReview
       || stage === 'integrity' || stage === 'quality'
     if (stage === 'test' && !config.requireProjectTests) requiredByPolicy = false
+    const hasUnavailableNode = requiredChecks.some(check => ['error', 'cancelled', 'skipped'].includes(check.status))
+      || requiredReviews.some(review => ['failed', 'cancelled', 'skipped'].includes(review.status))
     const status = requiredNodes === 0
       ? requiredByPolicy ? 'not-configured' as const : 'approved' as const
-      : passedNodes === requiredNodes ? 'approved' as const : 'rejected' as const
+      : passedNodes === requiredNodes ? 'approved' as const
+        : hasUnavailableNode ? 'unavailable' as const : 'rejected' as const
     if (status === 'not-configured') reasons.push(`${stage} has no required review node configured`)
+    if (status === 'unavailable') {
+      const unavailableChecks = requiredChecks
+        .filter(check => ['error', 'cancelled', 'skipped'].includes(check.status))
+        .map(check => `${check.id}:${check.status}`)
+      const unavailableReviews = requiredReviews
+        .filter(review => ['failed', 'cancelled', 'skipped'].includes(review.status))
+        .map(review => `${review.id}:${review.status}`)
+      reasons.push(`${stage} evaluation unavailable at ${[...unavailableChecks, ...unavailableReviews].join(', ')}`)
+    }
     if (status === 'rejected') {
       const failedChecks = requiredChecks.filter(check => check.status !== 'passed').map(check => `${check.id}:${check.status}`)
       const failedReviews = requiredReviews.filter(review => review.status !== 'approved').map(review => `${review.id}:${review.status}`)
@@ -412,7 +510,15 @@ function decideApproval(
     }
     return { stage, status, requiredNodes, passedNodes }
   })
-  return { status: reasons.length === 0 ? 'approved' : 'rejected', decidedAt: Date.now(), reasons, stages }
+  // An explicit deterministic/Reviewer rejection is conclusive even when it
+  // causes later nodes to be skipped. Only a pipeline with no rejecting node
+  // but at least one infrastructure-unavailable node is inconclusive.
+  const status: ArenaApprovalDecision['status'] = reasons.length === 0
+    ? 'approved'
+    : stages.some(stage => stage.status === 'rejected' || stage.status === 'not-configured')
+      ? 'rejected'
+      : 'unavailable'
+  return { status, decidedAt: Date.now(), reasons, stages }
 }
 
 function runMetrics(state: ArenaRunState): ArenaRunMetrics {
@@ -452,6 +558,273 @@ function runMetrics(state: ArenaRunState): ArenaRunMetrics {
   }
 }
 
+function portableReport(state: ArenaRunState): ArenaPortableReport {
+  let redactionsApplied = 0
+  let truncationsApplied = 0
+  const exactReferences = new Set([
+    state.repoRoot,
+    ...state.contenders.flatMap(contender => [
+      contender.worktreePath,
+      contender.childSessionId,
+      ...contender.credentialRefs,
+      ...contender.reviews.map(review => review.childSessionId),
+    ]),
+  ].filter(value => value.length > 0).sort((left, right) => right.length - left.length))
+
+  const text = (raw: string, maxChars = 4_000): string => {
+    let value = raw
+    for (const reference of exactReferences) {
+      while (value.includes(reference)) {
+        value = value.replace(reference, '<redacted-reference>')
+        redactionsApplied += 1
+      }
+    }
+    const redact = (pattern: RegExp, replacement: string): void => {
+      value = value.replace(pattern, () => {
+        redactionsApplied += 1
+        return replacement
+      })
+    }
+    redact(/-----BEGIN [^-\n]+ PRIVATE KEY-----[\s\S]*?-----END [^-\n]+ PRIVATE KEY-----/gu, '<redacted-private-key>')
+    redact(/\bsk-[A-Za-z0-9_-]{8,}\b/gu, '<redacted-api-token>')
+    redact(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b/gu, '<redacted-api-token>')
+    redact(/\bBearer\s+[A-Za-z0-9._~+/-]{8,}/giu, '<redacted-bearer-token>')
+    value = value.replace(
+      /\b(api[_-]?key|access[_-]?token|secret|password)\s*[:=]\s*([^\s,;]+)/giu,
+      (_match, name: string) => {
+        redactionsApplied += 1
+        return `${name}=<redacted-secret>`
+      },
+    )
+    value = value.replace(
+      /(^|[\s"'`(])((?:\/[A-Za-z0-9._~@+-]+){2,})/gu,
+      (_match, prefix: string) => {
+        redactionsApplied += 1
+        return `${prefix}<redacted-path>`
+      },
+    )
+    value = value.replace(
+      /(^|[\s"'`(])([A-Za-z]:\\(?:[^\\\s"'`<>]+\\)*[^\\\s"'`<>]+)/gu,
+      (_match, prefix: string) => {
+        redactionsApplied += 1
+        return `${prefix}<redacted-path>`
+      },
+    )
+    if (value.length <= maxChars) return value
+    truncationsApplied += 1
+    return `${value.slice(0, Math.max(0, maxChars - 1))}…`
+  }
+
+  const usage = (value: ArenaTokenUsage): ArenaTokenUsage => ({
+    inputTokens: value.inputTokens,
+    outputTokens: value.outputTokens,
+    cacheReadTokens: value.cacheReadTokens,
+    cacheWriteTokens: value.cacheWriteTokens,
+    reasoningTokens: value.reasoningTokens,
+    totalTokens: value.totalTokens,
+  })
+  const progress = (value: ArenaProgress): ArenaPortableProgress => ({
+    notifications: value.notifications,
+    events: value.events,
+    toolCalls: value.toolCalls,
+    modelCalls: value.modelCalls,
+    usage: usage(value.usage),
+  })
+  const identity = (value: ArenaModelIdentity): ArenaModelIdentity => ({
+    ...value.organization === undefined ? {} : { organization: text(value.organization, 512) },
+    ...value.gateway === undefined ? {} : { gateway: text(value.gateway, 512) },
+    ...value.modelFamily === undefined ? {} : { modelFamily: text(value.modelFamily, 512) },
+  })
+  const finding = (value: ArenaSecurityFinding): ArenaSecurityFinding => ({
+    ruleId: text(value.ruleId, 512),
+    severity: value.severity,
+    path: text(value.path, 2_000),
+    ...value.line === undefined ? {} : { line: value.line },
+    message: text(value.message, 2_000),
+    ...value.fingerprint === undefined ? {} : { fingerprint: value.fingerprint },
+  })
+  const check = (value: ArenaCheckResult): ArenaPortableCheck => ({
+    id: text(value.id, 512),
+    label: text(value.label, 1_000),
+    stage: value.stage,
+    kind: value.kind,
+    required: value.required,
+    status: value.status,
+    exitCode: value.exitCode,
+    signal: value.signal === null ? null : text(value.signal, 128),
+    timedOut: value.timedOut,
+    startedAt: value.startedAt,
+    finishedAt: value.finishedAt,
+    durationMs: value.durationMs,
+    outputTruncated: value.outputTruncated,
+    ...value.sandbox === undefined ? {} : {
+      sandbox: {
+        mode: value.sandbox.mode,
+        enforcement: value.sandbox.enforcement,
+        networkIsolated: false,
+        hostReadsIsolated: false,
+      },
+    },
+  })
+  const review = (value: ArenaReviewState): ArenaPortableReview => ({
+    id: text(value.id, 512),
+    label: text(value.label, 1_000),
+    stage: value.stage,
+    provider: text(value.provider, 512),
+    model: text(value.model, 512),
+    identity: identity(value.identity),
+    ...value.artifactHash === undefined ? {} : { artifactHash: value.artifactHash },
+    status: value.status,
+    ...value.startedAt === undefined ? {} : { startedAt: value.startedAt },
+    ...value.finishedAt === undefined ? {} : { finishedAt: value.finishedAt },
+    ...value.durationMs === undefined ? {} : { durationMs: value.durationMs },
+    attempts: value.attempts,
+    progress: progress(value.progress),
+    ...value.summary === undefined ? {} : { summary: text(value.summary) },
+    findings: value.findings.map(finding),
+    ...value.failureCode === undefined ? {} : { failureCode: value.failureCode },
+    ...value.repairAttempts === undefined ? {} : { repairAttempts: value.repairAttempts },
+  })
+  const contender = (value: ArenaContenderState): ArenaPortableContender => ({
+    id: text(value.id, 512),
+    label: text(value.label, 1_000),
+    provider: text(value.provider, 512),
+    model: text(value.model, 512),
+    identity: identity(value.identity),
+    status: value.status,
+    checkpoint: value.checkpoint,
+    attempts: value.attempts,
+    ...value.startedAt === undefined ? {} : { startedAt: value.startedAt },
+    ...value.builderDurationMs === undefined ? {} : { builderDurationMs: value.builderDurationMs },
+    ...value.finishedAt === undefined ? {} : { finishedAt: value.finishedAt },
+    ...value.cleanedAt === undefined ? {} : { cleanedAt: value.cleanedAt },
+    progress: progress(value.progress),
+    ...value.sealedArtifact === undefined ? {} : {
+      artifact: {
+        artifactHash: value.sealedArtifact.artifactHash,
+        headCommit: value.sealedArtifact.headCommit,
+        patchBytes: value.sealedArtifact.patchBytes,
+        untrackedBytes: value.sealedArtifact.untrackedBytes,
+        changedFiles: value.sealedArtifact.changedFiles.map(file => ({ ...file, path: text(file.path, 2_000) })),
+        addedLines: value.sealedArtifact.addedLines,
+        deletedLines: value.sealedArtifact.deletedLines,
+        sealedAt: value.sealedArtifact.sealedAt,
+      },
+    },
+    ...value.evidence === undefined ? {} : {
+      evaluation: {
+        patchHash: value.evidence.patchHash,
+        checks: value.evidence.checks.map(check),
+        securityFindings: value.evidence.securityFindings.map(finding),
+        decision: {
+          status: value.evidence.decision.status,
+          decidedAt: value.evidence.decision.decidedAt,
+          reasons: value.evidence.decision.reasons.map(reason => text(reason, 2_000)),
+          stages: value.evidence.decision.stages.map(stage => ({ ...stage })),
+        },
+      },
+    },
+    ...value.humanEvaluation === undefined ? {} : {
+      humanEvaluation: {
+        artifactHash: value.humanEvaluation.artifactHash,
+        verdict: value.humanEvaluation.verdict,
+        ...value.humanEvaluation.note === undefined ? {} : { note: text(value.humanEvaluation.note, 2_000) },
+        recordedAt: value.humanEvaluation.recordedAt,
+        previewReadyAt: value.humanEvaluation.previewReadyAt,
+        source: 'loopback-user-attestation',
+      },
+    },
+    reviews: value.reviews.map(review),
+  })
+
+  const report: ArenaPortableReport = {
+    schemaVersion: ARENA_REPORT_VERSION,
+    generatedAt: Date.now(),
+    runId: state.runId,
+    task: text(state.task, 20_000),
+    baseCommit: state.baseCommit,
+    status: state.status,
+    createdAt: state.createdAt,
+    updatedAt: state.updatedAt,
+    policy: {
+      source: state.policy.source,
+      policyId: text(state.policy.policyId, 512),
+      revision: text(state.policy.revision, 512),
+      digest: state.policy.digest,
+      signature: {
+        status: state.policy.signature.status,
+        ...state.policy.signature.keyId === undefined ? {} : { keyId: text(state.policy.signature.keyId, 512) },
+      },
+    },
+    budget: {
+      limits: { ...state.budget.limits },
+      consumed: { ...state.budget.consumed },
+      status: state.budget.status,
+      ...state.budget.exhausted === undefined ? {} : { exhausted: { ...state.budget.exhausted } },
+      stopAfterApproved: state.budget.stopAfterApproved,
+      stoppedContenders: state.budget.stoppedContenders.map(id => text(id, 512)),
+      ...state.budget.unlimitedBudgetAcknowledgedAt === undefined
+        ? {}
+        : { unlimitedBudgetAcknowledgedAt: state.budget.unlimitedBudgetAcknowledgedAt },
+    },
+    contenders: state.contenders.map(contender),
+    ...state.metrics === undefined ? {} : {
+      metrics: {
+        wallTimeMs: state.metrics.wallTimeMs,
+        agentTimeMs: state.metrics.agentTimeMs,
+        builders: state.metrics.builders,
+        reviewers: state.metrics.reviewers,
+        gateNodes: state.metrics.gateNodes,
+        usage: usage(state.metrics.usage),
+        byProvider: state.metrics.byProvider.map(group => ({
+          provider: text(group.provider, 512),
+          model: text(group.model, 512),
+          agents: group.agents,
+          usage: usage(group.usage),
+        })),
+      },
+    },
+    ...state.winner === undefined ? {} : {
+      winner: {
+        contenderId: text(state.winner.contenderId, 512),
+        reason: text(state.winner.reason, 2_000),
+        tieBreak: state.winner.tieBreak.map(item => text(item, 1_000)),
+      },
+    },
+    ...state.promotion === undefined ? {} : {
+      promotion: {
+        contenderId: text(state.promotion.contenderId, 512),
+        patchHash: state.promotion.patchHash,
+        promotedAt: state.promotion.promotedAt,
+        changedFiles: state.promotion.changedFiles.map(path => text(path, 2_000)),
+        verification: state.promotion.verification.map(item => text(item, 1_000)),
+      },
+    },
+    privacy: {
+      redactionsApplied: 0,
+      truncationsApplied: 0,
+      reviewBeforeSharing: true,
+      omitted: [
+        'repository and worktree absolute paths',
+        'credential references and values',
+        'child Session identifiers and raw JSONL',
+        'Builder final responses and Reviewer raw responses/errors',
+        'command arguments, stdout, and stderr',
+        'full patches and unified diffs',
+      ],
+    },
+    limitations: [
+      'This report describes one task run; it is not statistical model accuracy.',
+      'Provider telemetry may be missing or incomplete and tokens are not monetary cost.',
+      'Free-form retained text is conservatively redacted and bounded; review the file before sharing.',
+      'Complete local evidence remains in the Arena state directory and is not embedded here.',
+    ],
+  }
+  report.privacy.redactionsApplied = redactionsApplied
+  report.privacy.truncationsApplied = truncationsApplied
+  return report
+}
+
 /** One Host-owned Arena service. It owns every live cancellation controller and background promise. */
 export class ArenaService {
   private readonly store: ArenaStore
@@ -461,6 +834,7 @@ export class ArenaService {
   private readonly setupReports = new Map<string, ArenaSetupReport>()
   private readonly promotionGrants = new Map<string, PromotionGrant>()
   private readonly promotionLocks = new Set<string>()
+  private readonly candidatePreviews = new Map<string, CandidatePreviewSession>()
   private disposed = false
 
   constructor(
@@ -481,6 +855,97 @@ export class ArenaService {
     for (const record of this.store.recoverable()) await this.scheduleRecovery(record)
   }
 
+  /** Create one clean, committed demo repository for Web onboarding; it never registers the Workspace itself. */
+  async createDemoProject(): Promise<ArenaDemoProject> {
+    if (this.disposed) throw new Error('dsh-arena is shutting down')
+    const createdAt = Date.now()
+    const demosRoot = join(this.config.stateRoot, 'demos')
+    const projectPath = join(demosRoot, `arena-demo-${createdAt}-${randomUUID().slice(0, 8)}`)
+    await mkdir(demosRoot, { recursive: true, mode: 0o700 })
+    await mkdir(projectPath, { mode: 0o700 })
+
+    const runGit = async (args: readonly string[]): Promise<void> => {
+      const result = await this.processRunner.run(['git', ...args], {
+        cwd: projectPath,
+        timeoutMs: 30_000,
+        maxOutputBytes: this.config.maxOutputBytes,
+        sandbox: { mode: 'workspace-write', workspaceRoot: projectPath },
+      })
+      if (result.exitCode !== 0) {
+        const detail = [result.stderr, result.stdout].find(value => value.trim().length > 0)?.trim() ?? `exit ${String(result.exitCode)}`
+        throw new Error(`could not initialize the Arena demo repository: git ${args[0] ?? ''}: ${detail}`)
+      }
+    }
+
+    try {
+      const policyRules = hostProjectPolicy(this.config)
+      policyRules.requireProjectTests = true
+      policyRules.judgeCommands = [{
+        id: 'project-tests',
+        label: 'Node contract tests',
+        stage: 'test',
+        required: true,
+        command: 'node',
+        args: ['--test'],
+        timeoutMs: 120_000,
+      }]
+      const policy = {
+        schemaVersion: ARENA_POLICY_VERSION,
+        policyId: 'arena-demo-policy',
+        revision: '1',
+        rules: policyRules,
+      }
+      const manifest = {
+        name: 'dsh-evidence-arena-demo',
+        version: '1.0.0',
+        private: true,
+        description: 'Web-created Evidence Arena onboarding project',
+        type: 'commonjs',
+        scripts: { test: 'node --test' },
+      }
+      const source = "'use strict'\n\nmodule.exports = function sum(values) {\n  return 0\n}\n"
+      const tests = [
+        "'use strict'",
+        "const test = require('node:test')",
+        "const assert = require('node:assert/strict')",
+        "const sum = require('./sum')",
+        '',
+        "test('sums finite numbers without mutating the input', () => {",
+        '  const values = [1, 2, 3]',
+        '  assert.equal(sum(values), 6)',
+        '  assert.deepEqual(values, [1, 2, 3])',
+        '})',
+        "test('returns zero for an empty array', () => { assert.equal(sum([]), 0) })",
+        "test('rejects a non-array input', () => { assert.throws(() => sum('123'), TypeError) })",
+        "test('rejects non-number and non-finite elements', () => {",
+        "  for (const value of ['2', NaN, Infinity, -Infinity]) assert.throws(() => sum([1, value]), TypeError)",
+        '})',
+        '',
+      ].join('\n')
+      const readme = `# Evidence Arena Web demo\n\nThis repository was created from the Evidence Arena Web workbench.\n\nSuggested task:\n\n${DEMO_TASK}\n`
+
+      await mkdir(join(projectPath, '.dsh'), { mode: 0o700 })
+      await Promise.all([
+        writeFile(join(projectPath, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 }),
+        writeFile(join(projectPath, 'sum.js'), source, { mode: 0o600 }),
+        writeFile(join(projectPath, 'sum.test.js'), tests, { mode: 0o600 }),
+        writeFile(join(projectPath, 'README.md'), readme, { mode: 0o600 }),
+        writeFile(join(projectPath, '.dsh', 'arena-policy.json'), `${JSON.stringify(policy, null, 2)}\n`, { mode: 0o600 }),
+      ])
+      await runGit(['init', '-b', 'main'])
+      await runGit(['add', '--', '.'])
+      await runGit([
+        '-c', 'user.name=Evidence Arena',
+        '-c', 'user.email=evidence-arena@local.invalid',
+        'commit', '-m', 'Initialize Evidence Arena Web demo',
+      ])
+      return { path: projectPath, template: 'commonjs-sum', createdAt, suggestedTask: DEMO_TASK }
+    } catch (error) {
+      await rm(projectPath, { recursive: true, force: true })
+      throw error
+    }
+  }
+
   /** Admit and schedule a new run after proving a clean immutable Git base. */
   async start(request: ArenaStartRequest): Promise<ArenaRunState> {
     if (this.disposed) throw new Error('dsh-arena is shutting down')
@@ -491,6 +956,7 @@ export class ArenaService {
     if (this.controllers.size >= this.config.maxConcurrentRuns) {
       throw new Error(`Arena already has ${this.controllers.size} active run(s); maxConcurrentRuns is ${this.config.maxConcurrentRuns}`)
     }
+    assertBudgetAcknowledged(this.config, request.acknowledgeUnlimitedBudget)
     const preflight = await this.preflight(request.cwd)
     if (!preflight.ready) throw new Error(`Arena preflight blocked: ${preflight.blockers.join('; ')}`)
     const repo = await this.git.discover(request.cwd, request.signal)
@@ -510,7 +976,10 @@ export class ArenaService {
       createdAt: now,
       updatedAt: now,
       policy: structuredClone(policy.snapshot),
-      budget: initialRunBudget(this.config),
+      budget: initialRunBudget(
+        this.config,
+        preflight.budget.requiresAcknowledgement ? now : undefined,
+      ),
       contenders: this.config.contenders.map(contender => ({
         id: contender.id,
         label: contender.label,
@@ -578,9 +1047,20 @@ export class ArenaService {
       'Harness sandbox confines file effects; it does not currently isolate network access.',
       'Harness sandbox confines file effects; it does not currently isolate host reads.',
     ]
+    const budget = configuredBudgetPolicy(this.config)
     const remediations: ArenaPreflightRemediation[] = []
     const remediate = (item: ArenaPreflightRemediation): void => {
       if (!remediations.some(existing => existing.id === item.id)) remediations.push(item)
+    }
+    if (budget.requiresAcknowledgement) {
+      warnings.push(`run budget is unlimited for ${budget.unlimited.join(', ')}; every start and retry requires explicit acknowledgement`)
+      remediate({
+        id: 'finite-run-budget',
+        severity: 'warning',
+        title: 'Configure finite run budgets',
+        detail: 'Set positive maxRunTokens and maxRunModelCalls in the Arena Host profile to bound paid model usage without a per-run acknowledgement.',
+        action: 'edit-profile',
+      })
     }
     const credentials: ArenaPreflight['credentials'] = []
     for (const [ref, refsConsumers] of consumers) {
@@ -593,7 +1073,7 @@ export class ArenaService {
             id: `credential-${ref}`,
             severity: 'blocker',
             title: `Configure credential ${ref}`,
-            detail: 'Open Harness Models settings or export this reference before starting DSH. The wizard never accepts secret values.',
+            detail: 'Use Harness Models settings or the secure field in this Arena setup page. Harness stores the value; Arena never writes it to run state or repository policy.',
             action: 'configure-credential',
           })
         }
@@ -655,6 +1135,13 @@ export class ArenaService {
         detail: 'Edit the policy template in the setup card with one argv-only test command that is valid for this repository.',
         action: 'write-policy-pack',
       })
+    } else if (!rules.requireProjectTests && requiredTests.length === 0) {
+      warnings.push('no required project test judgeCommand is configured; comparisons can run, but correctness relies on built-in gates and model review')
+      remediate({
+        id: 'project-test-command', severity: 'warning', title: 'Add a required project test command',
+        detail: 'For production comparisons, add one repository-valid argv-only test command and enable requireProjectTests.',
+        action: 'write-policy-pack',
+      })
     }
     if (rules.requireLogicReview && !this.config.reviewers.some(review => review.stage === 'logic' && review.required)) {
       blockers.push('repository policy requires logic review but no required logic Reviewer is configured')
@@ -707,6 +1194,7 @@ export class ArenaService {
       credentials,
       reviewCorrelations,
       policy: policy.snapshot,
+      budget,
       remediations,
       gates: {
         requireProjectTests: rules.requireProjectTests,
@@ -787,6 +1275,11 @@ export class ArenaService {
     }))
   }
 
+  /** Build a fresh, privacy-bounded report without exposing the durable state record itself. */
+  report(runId: string): ArenaPortableReport {
+    return portableReport(this.requireRun(runId).snapshot())
+  }
+
   /** Build a browser response with state-dependent polling cadence. */
   response(run: ArenaRunState): ArenaRunResponse {
     return { run, pollAfterMs: isActiveArenaStatus(run.status) ? this.config.activePollMs : this.config.terminalPollMs }
@@ -836,6 +1329,191 @@ export class ArenaService {
     }
   }
 
+  /** Read the ephemeral launch state for one sealed candidate without starting code. */
+  candidatePreviewStatus(runId: string, contenderId: string): ArenaCandidatePreview {
+    const key = this.previewKey(runId, contenderId)
+    const active = this.candidatePreviews.get(key)
+    if (active !== undefined) {
+      if (active.handle !== undefined) this.refreshPreviewOutput(active)
+      return structuredClone(active.state)
+    }
+    const state = this.requireRun(runId).snapshot()
+    const contender = contenderOf(state, contenderId)
+    const evidence = contender.evidence
+    const artifactHash = evidence?.patchHash ?? contender.sealedArtifact?.artifactHash ?? ''
+    const securityPreflight = evidence?.checks.find(check => check.id === 'security-preflight')
+    const previewable = evidence !== undefined
+      && securityPreflight?.status === 'passed'
+      && !hasBlockingSecurityFinding(evidence.securityFindings)
+    const unavailableReason = evidence === undefined
+      ? 'candidate has no sealed evaluation evidence yet'
+      : !previewable
+          ? 'candidate preview is unavailable because deterministic security preflight did not pass'
+          : undefined
+    return {
+      runId, contenderId, artifactHash,
+      status: previewable ? 'idle' : 'unavailable',
+      stdout: '', stderr: '', outputTruncated: false,
+      ...unavailableReason === undefined ? {} : { error: unavailableReason },
+      safety: {
+        explicitStartRequired: true, disposableWorktree: true, loopbackRequested: true,
+        networkIsolated: false, hostReadsIsolated: false,
+      },
+    }
+  }
+
+  /** Materialize and start one exact candidate only after an explicit loopback acknowledgement. */
+  async startCandidatePreview(runId: string, contenderId: string, acknowledged: boolean): Promise<ArenaCandidatePreview> {
+    if (!acknowledged) throw new Error('candidate preview requires explicit acknowledgement of its runtime boundary')
+    const key = this.previewKey(runId, contenderId)
+    const previous = this.candidatePreviews.get(key)
+    if (previous?.state.status === 'running' || previous?.state.status === 'starting') {
+      return this.candidatePreviewStatus(runId, contenderId)
+    }
+
+    const state = this.requireRun(runId).snapshot()
+    if (isActiveArenaStatus(state.status)) throw new Error(`Arena run ${runId} is still active`)
+    const contender = contenderOf(state, contenderId)
+    const evidence = contender.evidence
+    if (evidence === undefined) throw new Error(`contender ${contenderId} has no sealed evidence to preview`)
+    const securityPreflight = evidence.checks.find(check => check.id === 'security-preflight')
+    if (securityPreflight?.status !== 'passed' || hasBlockingSecurityFinding(evidence.securityFindings)) {
+      throw new Error('candidate preview is unavailable because deterministic security preflight did not pass')
+    }
+    const candidate = await this.readCandidate(state, contenderId)
+    if (candidateHash(candidate) !== evidence.patchHash) throw new Error('candidate preview artifact hash no longer matches sealed evidence')
+
+    const worktreePath = join(this.config.stateRoot, 'candidate-previews', runId, contenderId, randomUUID())
+    const preview: CandidatePreviewSession = {
+      worktreePath,
+      stopping: false,
+      state: {
+        runId, contenderId, artifactHash: evidence.patchHash, status: 'starting',
+        startedAt: Date.now(), stdout: '', stderr: '', outputTruncated: false,
+        safety: {
+          explicitStartRequired: true, disposableWorktree: true, loopbackRequested: true,
+          networkIsolated: false, hostReadsIsolated: false,
+        },
+      },
+    }
+    this.candidatePreviews.set(key, preview)
+    const repo: ArenaRepository = { root: state.repoRoot, baseCommit: state.baseCommit }
+    const controller = new AbortController()
+    try {
+      await this.git.createWorktree(repo, worktreePath, `${runId} candidate-preview`, controller.signal)
+      await this.git.applyPatch(worktreePath, candidate.patch, controller.signal)
+      await this.git.copyUntracked(worktreePath, this.store.contenderArtifacts(runId, contenderId), candidate.untracked)
+      const auditDir = join(this.config.stateRoot, 'candidate-preview-audits', randomUUID())
+      try {
+        const captured = await this.git.capture(repo, worktreePath, auditDir, controller.signal)
+        if (captured.evidence.patchHash !== evidence.patchHash) throw new Error('materialized candidate preview does not match sealed evidence')
+      } finally {
+        await rm(auditDir, { recursive: true, force: true })
+      }
+
+      const port = await reserveLoopbackPort()
+      const launch = await selectCandidatePreviewLaunch(worktreePath, port)
+      if (launch === undefined) {
+        preview.state.status = 'unavailable'
+        preview.state.error = 'No preview launch was found. Produce dist/build/out/index.html or declare an npm preview, dev, or start script.'
+        preview.state.finishedAt = Date.now()
+        await this.removeCandidatePreviewWorktree(state.repoRoot, worktreePath)
+        return structuredClone(preview.state)
+      }
+      preview.state.launch = { kind: launch.kind, label: launch.label, argv: launch.publicArgv }
+      const url = `http://127.0.0.1:${port}/`
+      const handle = this.processRunner.start(launch.argv, {
+        cwd: worktreePath,
+        maxOutputBytes: this.config.maxOutputBytes,
+        env: launch.env,
+        sandbox: { mode: launch.sandboxMode, workspaceRoot: worktreePath },
+      })
+      preview.handle = handle
+      preview.state.pid = handle.pid
+      if (handle.sandbox?.enforcement !== undefined) preview.state.safety.sandboxEnforcement = handle.sandbox.enforcement
+      await waitForCandidatePreview(url, this.config.previewStartupTimeoutMs, handle.done)
+      this.refreshPreviewOutput(preview)
+      preview.state.status = 'running'
+      preview.state.readyAt = Date.now()
+      preview.state.url = url
+      void handle.done.then(async (result) => {
+        await this.finishCandidatePreview(key, preview, result)
+      }).catch(async (error: unknown) => {
+        await this.finishCandidatePreview(key, preview, undefined, error)
+      })
+      return structuredClone(preview.state)
+    } catch (error) {
+      if (preview.handle !== undefined) await preview.handle.stop().catch(() => undefined)
+      this.refreshPreviewOutput(preview)
+      preview.state.status = 'failed'
+      preview.state.finishedAt = Date.now()
+      preview.state.error = errorMessage(error)
+      await this.removeCandidatePreviewWorktree(state.repoRoot, worktreePath)
+      return structuredClone(preview.state)
+    }
+  }
+
+  /** Stop the complete preview process tree and remove its disposable worktree. */
+  async stopCandidatePreview(runId: string, contenderId: string): Promise<ArenaCandidatePreview> {
+    const key = this.previewKey(runId, contenderId)
+    const preview = this.candidatePreviews.get(key)
+    if (preview === undefined) return this.candidatePreviewStatus(runId, contenderId)
+    preview.stopping = true
+    if (preview.handle !== undefined) await preview.handle.stop().catch(() => undefined)
+    this.refreshPreviewOutput(preview)
+    preview.state.status = 'stopped'
+    preview.state.finishedAt = Date.now()
+    delete preview.state.pid
+    delete preview.state.url
+    delete preview.handle
+    await this.removeCandidatePreviewWorktree(this.requireRun(runId).snapshot().repoRoot, preview.worktreePath)
+    return structuredClone(preview.state)
+  }
+
+  /** Persist an explicit human UAT verdict without changing automated approval or ranking. */
+  async recordHumanEvaluation(
+    runId: string,
+    contenderId: string,
+    verdict: ArenaHumanEvaluation['verdict'],
+    rawNote: string | undefined,
+    acknowledged: boolean,
+  ): Promise<ArenaRunState> {
+    if (!acknowledged) throw new Error('human evaluation requires an explicit local-user acknowledgement')
+    if (!['passed', 'failed', 'inconclusive'].includes(verdict)) throw new Error(`invalid human evaluation verdict: ${verdict}`)
+    const note = rawNote?.trim()
+    if ((note?.length ?? 0) > 2_000) throw new Error('human evaluation note exceeds 2000 characters')
+    if (note?.includes('\0') === true) throw new Error('human evaluation note contains a null byte')
+
+    const record = this.requireRun(runId)
+    const state = record.snapshot()
+    if (isActiveArenaStatus(state.status)) throw new Error(`Arena run ${runId} is still active`)
+    const contender = contenderOf(state, contenderId)
+    const artifactHash = contender.evidence?.patchHash
+    if (artifactHash === undefined) throw new Error(`contender ${contenderId} has no sealed evidence to evaluate`)
+    const preview = this.candidatePreviews.get(this.previewKey(runId, contenderId))?.state
+    if (preview === undefined || preview.readyAt === undefined) {
+      throw new Error('start and successfully open this candidate preview before recording human evaluation')
+    }
+    const previewReadyAt = preview.readyAt
+    if (preview.artifactHash !== artifactHash) throw new Error('human evaluation preview no longer matches the sealed candidate artifact')
+
+    return await record.update(
+      'contender/human-evaluation',
+      `Recorded local-user UAT verdict for contender ${contenderId}.`,
+      (draft) => {
+        const target = contenderOf(draft, contenderId)
+        target.humanEvaluation = {
+          artifactHash,
+          verdict,
+          ...note === undefined || note.length === 0 ? {} : { note },
+          recordedAt: Date.now(),
+          previewReadyAt,
+          source: 'loopback-user-attestation',
+        }
+      },
+    )
+  }
+
   /** Request cancellation of live child runtimes and publish it immediately. */
   async cancel(runId: string): Promise<ArenaRunState> {
     const record = this.requireRun(runId)
@@ -872,6 +1550,9 @@ export class ArenaService {
     const state = record.snapshot()
     if (isActiveArenaStatus(state.status)) throw new Error(`Arena run ${runId} is active; cancel it before cleanup`)
     for (const contender of state.contenders) {
+      if (this.candidatePreviews.has(this.previewKey(runId, contender.id))) {
+        await this.stopCandidatePreview(runId, contender.id)
+      }
       if (contender.cleanedAt !== undefined) continue
       await this.git.removeWorktree(state.repoRoot, contender.worktreePath)
     }
@@ -1041,6 +1722,12 @@ export class ArenaService {
   async dispose(): Promise<void> {
     this.disposed = true
     for (const controller of this.controllers.values()) controller.abort(new Error('Arena plugin disposed.'))
+    await Promise.allSettled([...this.candidatePreviews.values()].map(async (preview) => {
+      preview.stopping = true
+      if (preview.handle !== undefined) await preview.handle.stop()
+      const run = this.store.get(preview.state.runId)?.snapshot()
+      if (run !== undefined) await this.removeCandidatePreviewWorktree(run.repoRoot, preview.worktreePath)
+    }))
     await Promise.allSettled([...this.backgrounds])
   }
 
@@ -1123,6 +1810,12 @@ export class ArenaService {
   private async scheduleRecovery(record: ArenaRunRecord): Promise<void> {
     const before = record.snapshot()
     try {
+      const unacknowledgedUnlimited = unlimitedBudgetKinds(before.budget.limits)
+      if (unacknowledgedUnlimited.length > 0 && before.budget.unlimitedBudgetAcknowledgedAt === undefined) {
+        throw new Error(
+          `legacy run has unacknowledged unlimited ${unacknowledgedUnlimited.join(' and ')} budget; retry it with explicit consent`,
+        )
+      }
       const inspected = await this.git.inspect(before.repoRoot)
       if (inspected.baseCommit !== before.baseCommit || !inspected.clean) {
         throw new Error('the original worktree no longer matches the clean immutable run base')
@@ -1255,11 +1948,15 @@ export class ArenaService {
       const state = record.snapshot()
       const eligible = state.contenders.filter(contender => contender.evidence?.decision.status === 'approved')
       if (eligible.length === 0) {
-        await record.update('run/error', 'No contender received final approval.', (draft) => {
-          draft.status = 'failed'
+        const evaluationUnavailable = state.contenders.some(contender => contender.evidence?.decision.stages
+          .some(stage => stage.status === 'unavailable'))
+        await record.update('run/error', 'Comparison completed without a fully approved candidate.', (draft) => {
+          draft.status = 'completed'
           refreshRunBudget(draft)
           draft.metrics = runMetrics(draft)
-          draft.error = 'No contender passed every required integrity, quality, test, logic, and security node.'
+          draft.error = evaluationUnavailable
+            ? 'Comparison completed, but one or more required evaluation nodes were unavailable. This is not an explicit Reviewer rejection of every candidate.'
+            : 'Comparison completed, but no contender passed every required integrity, quality, test, logic, and security node.'
         })
         return
       }
@@ -1460,7 +2157,9 @@ export class ArenaService {
       }
       await record.update('contender/evidence', `${contenderId} final decision: ${decision.status}.`, (draft) => {
         const target = contenderOf(draft, contenderId)
-        target.status = decision.status === 'approved' ? 'passed' : 'rejected'
+        target.status = decision.status === 'approved'
+          ? 'passed'
+          : decision.status === 'unavailable' ? 'evaluation-unavailable' : 'rejected'
         target.finishedAt = Date.now()
         target.headCommit = captured.headCommit
         target.evidence = evidence
@@ -1710,18 +2409,59 @@ export class ArenaService {
         delete target.summary
         delete target.response
         delete target.responseTruncated
+        delete target.failureCode
+        delete target.repairAttempts
         target.findings = []
       })
-      const result = await this.runtime.run(spec, async (progress) => {
-        await record.update('review/status', `${contenderId}/${reviewer.id} progress snapshot.`, (draft) => {
-          const target = reviewOf(contenderOf(draft, contenderId), reviewer.id)
-          target.progress = progress
-          target.usage = progress.usage
-          refreshRunBudget(draft)
-        })
+      let aggregate = emptyProgress()
+      const invoke = async (request: ArenaRuntimeSpec) => {
+        const base = structuredClone(aggregate)
+        let latest = emptyProgress()
+        const result = await this.runtime.run(request, async (progress) => {
+          latest = structuredClone(progress)
+          const combined = mergedProgress(base, progress, this.config.activityLimit)
+          await record.update('review/status', `${contenderId}/${reviewer.id} progress snapshot.`, (draft) => {
+            const target = reviewOf(contenderOf(draft, contenderId), reviewer.id)
+            target.progress = combined
+            target.usage = combined.usage
+            refreshRunBudget(draft)
+          })
+          await this.enforceBudget(record, control)
+        }, signal)
+        latest.notifications = Math.max(latest.notifications, result.notifications)
+        latest.events = Math.max(latest.events, result.events)
+        latest.usage = structuredClone(result.usage)
+        aggregate = mergedProgress(base, latest, this.config.activityLimit)
+        return result
+      }
+
+      let result = await invoke(spec)
+      let parsed: ParsedReview
+      try {
+        parsed = parseReviewResult(result.finalResponse, result.usage, reviewer.maxTokens)
+      } catch (error) {
+        if (!(error instanceof ReviewOutputError)) throw error
         await this.enforceBudget(record, control)
-      }, signal)
-      const parsed = parseReviewResponse(result.finalResponse)
+        const repairAttempt = (review.repairAttempts ?? 0) + 1
+        await record.update('review/status', `${contenderId}/${reviewer.id} requested one compact JSON finalization.`, (draft) => {
+          const target = reviewOf(contenderOf(draft, contenderId), reviewer.id)
+          target.attempts += 1
+          target.repairAttempts = repairAttempt
+          target.failureCode = error.code
+          target.error = `${error.message}; requesting one bounded JSON-only finalization turn`
+        })
+        const repairMaxTokens = Math.min(reviewer.maxTokens ?? this.config.reviewRepairMaxTokens, this.config.reviewRepairMaxTokens)
+        result = await invoke({
+          ...spec,
+          agent: { ...reviewer, maxTokens: repairMaxTokens },
+          // A max-token turn cannot be relied on as a resumable conversation
+          // across a newly launched SDK child. Use a fresh, auditable Session
+          // and repeat the bounded sealed bundle before the correction request.
+          childSessionId: `${review.childSessionId}-repair-${repairAttempt}`,
+          prompt: `${prompt}\n\nREVIEW_OUTPUT_FINALIZATION\n${reviewRepairPrompt(error)}`,
+        })
+        parsed = parseReviewResult(result.finalResponse, result.usage, repairMaxTokens)
+      }
       const blockingFinding = parsed.findings.some(item => item.severity === 'critical' || item.severity === 'high')
       const approved = parsed.verdict === 'approve' && !(reviewer.stage === 'security' && blockingFinding)
       const response = boundedText(result.finalResponse, this.config.maxFinalResponseChars)
@@ -1731,12 +2471,14 @@ export class ArenaService {
         target.status = approved ? 'approved' : 'rejected'
         target.finishedAt = finishedAt
         target.durationMs = target.startedAt === undefined ? 0 : finishedAt - target.startedAt
-        target.usage = result.usage
-        target.progress.usage = result.usage
+        target.usage = structuredClone(aggregate.usage)
+        target.progress = structuredClone(aggregate)
         target.summary = parsed.summary
         target.findings = parsed.findings
         target.response = response.text
         target.responseTruncated = response.truncated
+        delete target.failureCode
+        delete target.error
         refreshRunBudget(draft)
       })
       await this.enforceBudget(record, control)
@@ -1748,6 +2490,12 @@ export class ArenaService {
         target.finishedAt = finishedAt
         target.durationMs = target.startedAt === undefined ? 0 : finishedAt - target.startedAt
         target.error = errorMessage(error)
+        target.failureCode = error instanceof ReviewOutputError ? error.code : 'runtime-error'
+        if (error instanceof ReviewOutputError) {
+          const response = boundedText(error.response, this.config.maxFinalResponseChars)
+          target.response = response.text
+          target.responseTruncated = response.truncated
+        }
         refreshRunBudget(draft)
       })
     } finally {
@@ -1924,6 +2672,46 @@ export class ArenaService {
           }
         }
       }
+    })
+  }
+
+  private previewKey(runId: string, contenderId: string): string {
+    return `${runId}\0${contenderId}`
+  }
+
+  private refreshPreviewOutput(preview: CandidatePreviewSession): void {
+    if (preview.handle === undefined) return
+    const output = preview.handle.output()
+    preview.state.stdout = output.stdout
+    preview.state.stderr = output.stderr
+    preview.state.outputTruncated = output.stdoutTruncated || output.stderrTruncated
+  }
+
+  private async finishCandidatePreview(
+    key: string,
+    preview: CandidatePreviewSession,
+    result?: ProcessResult,
+    error?: unknown,
+  ): Promise<void> {
+    if (this.candidatePreviews.get(key) !== preview || preview.handle === undefined) return
+    this.refreshPreviewOutput(preview)
+    preview.state.status = preview.stopping ? 'stopped' : 'failed'
+    preview.state.finishedAt = Date.now()
+    if (!preview.stopping) {
+      preview.state.error = error === undefined
+        ? `candidate preview process exited unexpectedly (${result?.exitCode ?? result?.signal ?? 'unknown'})`
+        : errorMessage(error)
+    }
+    delete preview.state.pid
+    delete preview.state.url
+    delete preview.handle
+    const run = this.store.get(preview.state.runId)?.snapshot()
+    if (run !== undefined) await this.removeCandidatePreviewWorktree(run.repoRoot, preview.worktreePath)
+  }
+
+  private async removeCandidatePreviewWorktree(repoRoot: string, worktreePath: string): Promise<void> {
+    await this.git.removeWorktree(repoRoot, worktreePath).catch((error: unknown) => {
+      this.log(`candidate preview worktree cleanup failed: ${errorMessage(error)}`)
     })
   }
 

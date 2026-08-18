@@ -54,12 +54,35 @@ describe('Arena Host composition', () => {
     }))
     const started = { runId: 'arena-1', workspaceId: 'workspace-1' }
     const start = vi.fn(async () => started)
+    const candidatePreview = {
+      runId: 'arena-1', contenderId: 'direct', artifactHash: 'a'.repeat(64), status: 'idle',
+      stdout: '', stderr: '', outputTruncated: false,
+      safety: {
+        explicitStartRequired: true, disposableWorktree: true, loopbackRequested: true,
+        networkIsolated: false, hostReadsIsolated: false,
+      },
+    }
+    const startCandidatePreview = vi.fn(async () => ({ ...candidatePreview, status: 'running' }))
+    const stopCandidatePreview = vi.fn(async () => ({ ...candidatePreview, status: 'stopped' }))
+    const recordHumanEvaluation = vi.fn(async () => started)
+    const demoProject = {
+      path: '/fixture/generated-demo', template: 'commonjs-sum' as const,
+      createdAt: 2, suggestedTask: 'Fix the demo sum function.',
+    }
+    const createDemoProject = vi.fn(async () => demoProject)
+    const report = vi.fn(() => ({ schemaVersion: 1, runId: 'arena-1', privacy: { reviewBeforeSharing: true } }))
     const service = {
       dispose,
       list: () => [],
+      report,
       start,
       response: (run: unknown) => ({ run, pollAfterMs: 100 }),
       candidateFileDiff,
+      candidatePreviewStatus: () => candidatePreview,
+      startCandidatePreview,
+      stopCandidatePreview,
+      recordHumanEvaluation,
+      createDemoProject,
     } as unknown as ArenaService
 
     const plugin = await ctx.plugin({
@@ -73,14 +96,25 @@ describe('Arena Host composition', () => {
     const read = channels.get('/arena-read')!
     await expect(read.handler('list', {}, new AbortController().signal))
       .resolves.toEqual({ ok: true, value: [] })
+    await expect(read.handler('report', { runId: 'arena-1' }, new AbortController().signal))
+      .resolves.toMatchObject({ ok: true, value: { schemaVersion: 1, runId: 'arena-1' } })
+    expect(report).toHaveBeenCalledWith('arena-1')
+    await expect(read.handler('report', {}, new AbortController().signal))
+      .resolves.toMatchObject({ ok: false, error: { code: 'bad-request' } })
     await expect(read.handler('candidate-file-diff', {
       runId: 'arena-1', contenderId: 'direct', path: 'app.txt',
     }, new AbortController().signal)).resolves.toMatchObject({
       ok: true, value: { runId: 'arena-1', contenderId: 'direct', file: { path: 'app.txt' } },
     })
     expect(candidateFileDiff).toHaveBeenCalledWith('arena-1', 'direct', 'app.txt')
+    await expect(read.handler('candidate-preview', {
+      runId: 'arena-1', contenderId: 'direct',
+    }, new AbortController().signal)).resolves.toMatchObject({ ok: true, value: { status: 'idle' } })
 
     const control = channels.get('/arena-control')!
+    await expect(control.handler('demo-create', {}, new AbortController().signal))
+      .resolves.toEqual({ ok: true, value: demoProject })
+    expect(createDemoProject).toHaveBeenCalledOnce()
     await expect(control.handler('start', {
       workspaceId: 'workspace-1', task: 'Implement a fixture',
     }, new AbortController().signal)).resolves.toMatchObject({
@@ -88,7 +122,33 @@ describe('Arena Host composition', () => {
     })
     expect(start).toHaveBeenCalledWith({
       workspaceId: 'workspace-1', cwd: '/fixture/repo', task: 'Implement a fixture',
+      acknowledgeUnlimitedBudget: false,
     })
+    await expect(control.handler('candidate-preview-start', {
+      runId: 'arena-1', contenderId: 'direct', acknowledged: true,
+    }, new AbortController().signal)).resolves.toMatchObject({ ok: true, value: { status: 'running' } })
+    expect(startCandidatePreview).toHaveBeenCalledWith('arena-1', 'direct', true)
+    await expect(control.handler('candidate-preview-start', {
+      runId: 'arena-1', contenderId: 'direct',
+    }, new AbortController().signal)).resolves.toMatchObject({ ok: false, error: { code: 'bad-request' } })
+    await expect(control.handler('candidate-preview-stop', {
+      runId: 'arena-1', contenderId: 'direct',
+    }, new AbortController().signal)).resolves.toMatchObject({ ok: true, value: { status: 'stopped' } })
+    expect(stopCandidatePreview).toHaveBeenCalledWith('arena-1', 'direct')
+    await expect(control.handler('human-evaluation', {
+      runId: 'arena-1', contenderId: 'direct', verdict: 'passed', note: 'Works in the browser.', acknowledged: true,
+    }, new AbortController().signal)).resolves.toMatchObject({
+      ok: true, value: { run: { runId: 'arena-1', workspaceId: 'workspace-1' } },
+    })
+    expect(recordHumanEvaluation).toHaveBeenCalledWith(
+      'arena-1', 'direct', 'passed', 'Works in the browser.', true,
+    )
+    await expect(control.handler('human-evaluation', {
+      runId: 'arena-1', contenderId: 'direct', verdict: 'passed',
+    }, new AbortController().signal)).resolves.toMatchObject({ ok: false, error: { code: 'bad-request' } })
+    await expect(control.handler('human-evaluation', {
+      runId: 'arena-1', contenderId: 'direct', verdict: 'unknown', acknowledged: true,
+    }, new AbortController().signal)).resolves.toMatchObject({ ok: false, error: { code: 'bad-request' } })
     await expect(control.handler('start', {
       workspaceId: 'missing', task: 'Do not run',
     }, new AbortController().signal)).resolves.toMatchObject({

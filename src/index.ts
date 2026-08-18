@@ -60,6 +60,11 @@ async function handleReadRequest(ctx: Context, service: ArenaService, endpoint: 
       if (runId === undefined) return badRequest('runId is required')
       return { ok: true as const, value: service.response(service.get(runId)) }
     }
+    if (endpoint === 'report') {
+      const runId = requiredString(payload, 'runId')
+      if (runId === undefined) return badRequest('runId is required')
+      return { ok: true as const, value: service.report(runId) }
+    }
     if (endpoint === 'setup') {
       const workspaceId = requiredString(payload, 'workspaceId')
       if (workspaceId === undefined) return badRequest('workspaceId is required')
@@ -74,6 +79,12 @@ async function handleReadRequest(ctx: Context, service: ArenaService, endpoint: 
         return badRequest('runId, contenderId, and path are required')
       }
       return { ok: true as const, value: await service.candidateFileDiff(runId, contenderId, path) }
+    }
+    if (endpoint === 'candidate-preview') {
+      const runId = requiredString(payload, 'runId')
+      const contenderId = requiredString(payload, 'contenderId')
+      if (runId === undefined || contenderId === undefined) return badRequest('runId and contenderId are required')
+      return { ok: true as const, value: service.candidatePreviewStatus(runId, contenderId) }
     }
     if (endpoint === 'list') return { ok: true as const, value: service.list() }
     return badRequest(`unknown Arena read endpoint: ${endpoint}`)
@@ -101,14 +112,30 @@ export function registerArenaSurfaces(ctx: Context, service: ArenaService): void
         const task = requiredString(payload, 'task')
         if (workspaceId === undefined || task === undefined) return badRequest('workspaceId and task are required')
         const target = workspaceTarget(ctx, workspaceId)
-        return { ok: true, value: service.response(await service.start({ ...target, task })) }
+        return {
+          ok: true,
+          value: service.response(await service.start({
+            ...target,
+            task,
+            acknowledgeUnlimitedBudget: payload?.acknowledgeUnlimitedBudget === true,
+          })),
+        }
+      }
+      if (endpoint === 'demo-create') {
+        return { ok: true, value: await service.createDemoProject() }
       }
       if (endpoint === 'retry') {
         const runId = requiredString(payload, 'runId')
         if (runId === undefined) return badRequest('runId is required')
         const original = service.get(runId)
         const target = workspaceTarget(ctx, original.workspaceId)
-        return { ok: true, value: service.response(await service.retry(runId, target)) }
+        return {
+          ok: true,
+          value: service.response(await service.retry(runId, {
+            ...target,
+            acknowledgeUnlimitedBudget: payload?.acknowledgeUnlimitedBudget === true,
+          })),
+        }
       }
       if (endpoint === 'cancel' || endpoint === 'cleanup') {
         const runId = requiredString(payload, 'runId')
@@ -126,6 +153,39 @@ export function registerArenaSurfaces(ctx: Context, service: ArenaService): void
         const token = requiredString(payload, 'token')
         if (token === undefined) return badRequest('token is required')
         return { ok: true, value: service.response(await service.confirmPromotion(token)) }
+      }
+      if (endpoint === 'candidate-preview-start') {
+        const runId = requiredString(payload, 'runId')
+        const contenderId = requiredString(payload, 'contenderId')
+        if (runId === undefined || contenderId === undefined || payload?.acknowledged !== true) {
+          return badRequest('runId, contenderId, and acknowledged=true are required')
+        }
+        return { ok: true, value: await service.startCandidatePreview(runId, contenderId, true) }
+      }
+      if (endpoint === 'candidate-preview-stop') {
+        const runId = requiredString(payload, 'runId')
+        const contenderId = requiredString(payload, 'contenderId')
+        if (runId === undefined || contenderId === undefined) return badRequest('runId and contenderId are required')
+        return { ok: true, value: await service.stopCandidatePreview(runId, contenderId) }
+      }
+      if (endpoint === 'human-evaluation') {
+        const runId = requiredString(payload, 'runId')
+        const contenderId = requiredString(payload, 'contenderId')
+        const verdict = requiredString(payload, 'verdict')
+        const note = payload?.note
+        if (runId === undefined || contenderId === undefined || verdict === undefined || payload?.acknowledged !== true) {
+          return badRequest('runId, contenderId, verdict, and acknowledged=true are required')
+        }
+        if (!['passed', 'failed', 'inconclusive'].includes(verdict)) return badRequest('verdict is invalid')
+        if (note !== undefined && typeof note !== 'string') return badRequest('note must be a string')
+        const run = await service.recordHumanEvaluation(
+          runId,
+          contenderId,
+          verdict as 'passed' | 'failed' | 'inconclusive',
+          note,
+          true,
+        )
+        return { ok: true, value: service.response(run) }
       }
       if (endpoint === 'policy-write') {
         const workspaceId = requiredString(payload, 'workspaceId')

@@ -29,6 +29,7 @@ const GENERATED_REMOTE = /^@deepseek-ai\/dsh-[a-z0-9]+(?:-[a-z0-9]+)*\/remote$/
 const CSS_VIRTUAL_PREFIX = '\0dsh-css:'
 const CSS_VIRTUAL_SUFFIX = '.mjs'
 const REPOSITORY_ROOT = fileURLToPath(new URL('.', import.meta.url))
+const CSS_ASSET_PATHS = new Map<string, string>()
 
 function browserSourcePath(source: string, sourcemapPath: string): string {
   if (!source.startsWith('.')) return source
@@ -69,13 +70,15 @@ const client: UserConfig = {
   dts: false,
   sourcemap: true,
   clean: false,
-  external: [...CLIENT_EXTERNALS],
+  deps: {
+    neverBundle: [...CLIENT_EXTERNALS],
+    alwaysBundle: (id: string) => (CLIENT_EXTERNALS.includes(id as typeof CLIENT_EXTERNALS[number]) ? undefined : true),
+  },
   define: {
     'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production'),
     'import.meta.env.MODE': JSON.stringify(process.env.NODE_ENV ?? 'production'),
     'import.meta.env': JSON.stringify({ MODE: process.env.NODE_ENV ?? 'production' }),
   },
-  noExternal: (id: string) => (CLIENT_EXTERNALS.includes(id as typeof CLIENT_EXTERNALS[number]) ? undefined : true),
   plugins: [{
     name: 'dsh-client-bundle-purity',
     resolveId(source: string) {
@@ -91,11 +94,15 @@ const client: UserConfig = {
     resolveId(source: string, importer: string | undefined) {
       if (!source.endsWith('.module.css')) return null
       const absolute = importer === undefined ? source : sourceAssetPath(source, importer)
-      return CSS_VIRTUAL_PREFIX + absolute + CSS_VIRTUAL_SUFFIX
+      const portable = relative(REPOSITORY_ROOT, absolute).split(sep).join('/')
+      const virtualId = CSS_VIRTUAL_PREFIX + portable + CSS_VIRTUAL_SUFFIX
+      CSS_ASSET_PATHS.set(virtualId, absolute)
+      return virtualId
     },
     async load(virtualId: string) {
       if (!virtualId.startsWith(CSS_VIRTUAL_PREFIX)) return null
-      const fileId = virtualId.slice(CSS_VIRTUAL_PREFIX.length, -CSS_VIRTUAL_SUFFIX.length)
+      const portable = virtualId.slice(CSS_VIRTUAL_PREFIX.length, -CSS_VIRTUAL_SUFFIX.length)
+      const fileId = CSS_ASSET_PATHS.get(virtualId) ?? resolvePath(REPOSITORY_ROOT, portable)
       this.addWatchFile(fileId)
       const source = await readFile(fileId)
       const { code, exports: cssExports } = transform({

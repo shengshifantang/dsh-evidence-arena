@@ -16,13 +16,32 @@ export { ArenaLauncher } from './ArenaLauncher.tsx'
 export { ArenaWorkbench } from './ArenaWorkbench.tsx'
 export type { ArenaCardFace } from './rpc.ts'
 
-export const inject = ['slots', 'locale', 'connection']
+export const inject = ['slots', 'locale', 'connection', 'workspaces']
 
 /** Register one additive launcher and overlay without owning or mutating chat Sessions. */
 export function apply(ctx: ClientContext): void {
   const connection = ctx.get('connection') as ConnectionHandle
   const workbenchStore = createArenaWorkbenchStore()
-  const face = () => arenaCardFace(connection.rpc, connection.isLoopback)
+  const requireLoopback = (): void => {
+    if (!connection.isLoopback) throw new Error('Arena Web setup is available only from the loopback Harness page')
+  }
+  const registerWorkspace = async (path: string): Promise<string> => {
+    requireLoopback()
+    return String((await ctx.workspaces.create({ path })).workspaceId)
+  }
+  const face = () => arenaCardFace(connection.rpc, connection.isLoopback, {
+    pickAndRegisterWorkspace: async () => {
+      requireLoopback()
+      const path = await ctx.workspaces.pickDirectory()
+      return path === null ? undefined : await registerWorkspace(path)
+    },
+    registerWorkspace,
+    setCredential: async (ref, value) => {
+      requireLoopback()
+      const response = await connection.api.credentials.set({ ref, value })
+      if (!response.result.ok) throw new Error(`${response.result.error.code}: ${response.result.error.message}`)
+    },
+  })
 
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'arena: browser dictionaries')
   ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
