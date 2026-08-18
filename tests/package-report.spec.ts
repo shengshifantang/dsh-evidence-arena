@@ -1,7 +1,19 @@
 import { describe, expect, it } from 'vitest'
+import { npmPackInvocation } from '../scripts/npm-pack-invocation.mjs'
 import { parseNpmPackReport } from '../scripts/npm-pack-report.mjs'
 
 describe('npm package report parsing', () => {
+  it('routes Windows batch launch through cmd.exe without a shell-injected argument list', () => {
+    expect(npmPackInvocation('win32', 'C:\\Windows\\System32\\cmd.exe')).toEqual({
+      command: 'C:\\Windows\\System32\\cmd.exe',
+      args: ['/d', '/s', '/c', 'npm.cmd pack --dry-run --json --ignore-scripts'],
+    })
+    expect(npmPackInvocation('linux')).toEqual({
+      command: 'npm',
+      args: ['pack', '--dry-run', '--json', '--ignore-scripts'],
+    })
+  })
+
   it('extracts the outer report after ANSI lifecycle output and nested arrays', () => {
     const stdout = [
       '\u001b[34mℹ tsdown build [client]\u001b[39m',

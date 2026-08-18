@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
+import { npmPackInvocation } from './npm-pack-invocation.mjs'
 import { parseNpmPackReport } from './npm-pack-report.mjs'
 
 const root = new URL('../', import.meta.url)
@@ -65,8 +66,8 @@ const expectedPacked = new Set([
 // this remains safe when invoked from prepack itself.
 const cache = await mkdtemp(join(tmpdir(), 'dsh-evidence-arena-npm-cache-'))
 try {
-  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  const { stdout } = await execFileAsync(npm, ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+  const npm = npmPackInvocation()
+  const { stdout } = await execFileAsync(npm.command, npm.args, {
     cwd: rootPath,
     encoding: 'utf8',
     env: { ...process.env, npm_config_cache: cache },
