@@ -18,7 +18,7 @@ Evidence Arena 是一个**独立于对话 Session 的多模型开发对比工作
 | 能否直接比较两个模型？ | **可以。** 每个 contender 可配置独立 provider、model、凭据引用、系统提示词和部署身份。 |
 | 能否给出速度、Token、代码量和准确性结论？ | **可以给出单任务证据结论。** 摘要表直接标出最快、Token 最少、改动最小、门禁通过数和机械领先者；统计准确率仍需要固定的多任务基准集。 |
 | 能否导出结果用于复盘或分享？ | **可以。** 终态运行可下载带版本的 JSON 评估报告，保留指标、哈希、文件元数据、门禁和 Reviewer 结论，同时排除本地路径、凭据引用、子 Session ID、原始输出、命令参数/输出与完整 Diff。 |
-| 是否已发布到公共 npm？ | **尚未。** 独立包名已经确定为 `dsh-evidence-arena`，当前可以分发构建好的 `.tgz`；只有首次成功发布后，公共 npm 包名才算真正被占用。 |
+| 是否已发布到公共 npm？ | **已经发布。** [`dsh-evidence-arena@0.1.0`](https://www.npmjs.com/package/dsh-evidence-arena/v/0.1.0) 已公开，可直接从 npm registry 安装。 |
 
 这是由社区独立维护的项目，正式源码仓库为
 [`shengshifantang/dsh-evidence-arena`](https://github.com/shengshifantang/dsh-evidence-arena)。
@@ -45,7 +45,7 @@ Arena 的宿主集成只有两面：
 - `0.1.0` tarball 已安装进由官方干净提交 [`47f943859b`](https://github.com/deepseek-ai/deepseek-harness/commit/47f943859b) 构建的全新 profile，安装以 0 退出；该 CLI 标识为 `@deepseek-ai/dsh@0.1.0-rc.5`。配置组合出现 `id: arena`，Web 启动返回 HTTP 200，启动清单与客户端 bundle 都包含 `dsh-evidence-arena`，左侧 A/B 入口可以打开双页签工作台，浏览器控制台无错误。
 - 运行时代码相同的一个 `0.1.0` 包构建也通过该官方 Host 完成了安装包级对比：四条本机脚本化 provider 路由驱动两个隔离 Builder、四次 Reviewer、项目测试和 556 个 provider 上报 Token；逐文件 Diff、两个可分别访问的前端预览、工件绑定人工验收、两阶段采纳、Host 重启恢复和工作树清理全部通过，浏览器控制台无错误。这是零费用的集成证据，不表示当前归档与当时字节级相同，也不代表外部模型质量。
 - 已在全新官方 `rc.7` Host 上，使用与当前相同的 Reviewer 与工程工具配方完成付费真实 provider 回归；这次回归位于最后的子运行时 home 隔离加固之前：两个 `deepseek-v4-flash` Builder 与四次独立 Reviewer 调用在 38.9 秒内完成，两个候选均通过 8/8 配置节点，provider 上报总量为 87,120 Token，其中包含 65,152 缓存读取 Token。四个 Reviewer 全部返回合法 verdict JSON，推理 Token 均为 0，输出 Token 介于 39–76。这证明了修复后的真实模型执行链；但两个候选使用的是同一条路由，且任务刻意保持小型，因此这不是跨模型质量基准。
-- 已在不修改本地脏的上游兼容性 checkout 的前提下拉取官方 `master`，并在提交 [`99f6f02fec`](https://github.com/deepseek-ai/deepseek-harness/commit/99f6f02fec)、`0.1.0-rc.7` 发布系列上完成源码对照。真实 provider 测试构建已在全新公共 registry Host 中安装，显示 A/B 入口，从工作台创建并注册演示 Git 项目，复用官方凭据引用，完成上述对比并渲染逐文件 Diff。加入子运行时 home 隔离和有限准入预算后，最终 tarball 又分别通过真实 JSON-RPC SDK E2E、全部 83 个测试、发布包校验、全新 `rc.7` 安装、Host 启动与 HTTP 200。没有仅为重复验证环境及预算防线而再消耗一次付费调用。
+- 已在不修改本地脏的上游兼容性 checkout 的前提下拉取官方 `master`，并在提交 [`99f6f02fec`](https://github.com/deepseek-ai/deepseek-harness/commit/99f6f02fec)、`0.1.0-rc.7` 发布系列上完成源码对照。真实 provider 测试构建已在全新公共 registry Host 中安装，显示 A/B 入口，从工作台创建并注册演示 Git 项目，复用官方凭据引用，完成上述对比并渲染逐文件 Diff。加入子运行时 home 隔离和有限准入预算后，最终 tarball 又分别通过真实 JSON-RPC SDK E2E、全部 83 个测试、发布包校验、全新 `rc.7` 安装、Host 启动与 HTTP 200。随后，精确的最终归档（`SHA-256 47442cc7ebbe5ec5d3c28baf68ab3883010390fcae726dd9fa8d98fbf9146862`）完成付费运行 `arena-20260819024635-c9ab4f4a`：两个 `deepseek-v4-flash` 候选均通过 8/8 门禁，记录 18 个证据节点，总计 14 次模型调用、约 78,000 Token；Evidence Builder 补丁仅在重新执行必需门禁并确认写入字节与封存证据一致后才完成采纳。这仍然只是一个针对性任务，不是跨任务准确率基准。
 
 ## 普通用户安装
 
@@ -249,7 +249,7 @@ v4 有意拒绝 v3 及更早的预发布状态，不进行猜测迁移。升级�
 - Reviewer 与规则提供工程证据，不替代完整 SAST、形式化验证或人工领域审查。
 - 便携报告会排除高风险原始证据，并对常见秘密与路径模式脱敏；但任务和 Reviewer 摘要仍是自由文本，对外发布前必须人工检查。
 - 普通文件系统无法让多文件 working-tree 写入完全原子；Arena 提供 WAL、复验和分叉保护。
-- 准备本仓库时，公共 npm 上尚无 `dsh-evidence-arena`；但只有首次成功发布后才算真正保留，发布前必须再次核对。
+- 公共 npm 版本不可覆盖；后续每个版本都必须先打包、完成 smoke，并核对线上上传工件后再对外宣布。
 - 只有与当前外置插件 seam 兼容的 DSH 版本才受支持；官方接口变化后需要重新构建与验证。
 
 ## 卸载
