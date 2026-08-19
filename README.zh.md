@@ -38,14 +38,14 @@ Arena 的宿主集成只有两面：
 
 这意味着兼容边界也很明确：Arena 应与构建它的 DSH 发布系列配套使用；跨版本升级要重新执行安装与浏览器 smoke，而不能假设私有接口永久稳定。
 
-### 已验证兼容性快照——2026-08-18
+### 已验证兼容性快照——2026-08-19
 
-- 独立仓库在 macOS 上通过 Host/Browser 两套 TypeScript 检查、17 个测试文件共 79 个用例、Host ESM 构建、浏览器加载器构建和发布包闭包校验。
+- 独立仓库在 macOS 上通过 Host/Browser 两套 TypeScript 检查、18 个测试文件共 83 个用例、Host ESM 构建、浏览器加载器构建和发布包闭包校验。
 - 完整 SDK E2E 使用真实 DSH JSON-RPC 子进程和 Agent loop，让两个 Builder 经 Harness 工具修改独立 worktree，再执行项目测试、逻辑/安全 Reviewer、Session JSONL 与 Token 计量、候选网页启动和两阶段采纳。模型传输使用本机脚本化 OpenAI-compatible 服务，因此证明的是 DSH/Arena 全链路，不是某个外部模型质量。
 - `0.1.0` tarball 已安装进由官方干净提交 [`47f943859b`](https://github.com/deepseek-ai/deepseek-harness/commit/47f943859b) 构建的全新 profile，安装以 0 退出；该 CLI 标识为 `@deepseek-ai/dsh@0.1.0-rc.5`。配置组合出现 `id: arena`，Web 启动返回 HTTP 200，启动清单与客户端 bundle 都包含 `dsh-evidence-arena`，左侧 A/B 入口可以打开双页签工作台，浏览器控制台无错误。
 - 运行时代码相同的一个 `0.1.0` 包构建也通过该官方 Host 完成了安装包级对比：四条本机脚本化 provider 路由驱动两个隔离 Builder、四次 Reviewer、项目测试和 556 个 provider 上报 Token；逐文件 Diff、两个可分别访问的前端预览、工件绑定人工验收、两阶段采纳、Host 重启恢复和工作树清理全部通过，浏览器控制台无错误。这是零费用的集成证据，不表示当前归档与当时字节级相同，也不代表外部模型质量。
 - 已在全新官方 `rc.7` Host 上，使用与当前相同的 Reviewer 与工程工具配方完成付费真实 provider 回归；这次回归位于最后的子运行时 home 隔离加固之前：两个 `deepseek-v4-flash` Builder 与四次独立 Reviewer 调用在 38.9 秒内完成，两个候选均通过 8/8 配置节点，provider 上报总量为 87,120 Token，其中包含 65,152 缓存读取 Token。四个 Reviewer 全部返回合法 verdict JSON，推理 Token 均为 0，输出 Token 介于 39–76。这证明了修复后的真实模型执行链；但两个候选使用的是同一条路由，且任务刻意保持小型，因此这不是跨模型质量基准。
-- 已在不修改本地脏的上游兼容性 checkout 的前提下拉取官方 `master`，并在提交 [`99f6f02fec`](https://github.com/deepseek-ai/deepseek-harness/commit/99f6f02fec)、`0.1.0-rc.7` 发布系列上完成源码对照。真实 provider 测试构建已在全新公共 registry Host 中安装，显示 A/B 入口，从工作台创建并注册演示 Git 项目，复用官方凭据引用，完成上述对比并渲染逐文件 Diff。加入子运行时 home 隔离和有限准入预算后，最终 tarball 又分别通过真实 JSON-RPC SDK E2E、全部 79 个测试、发布包校验、全新 `rc.7` 安装、Host 启动与 HTTP 200。没有仅为重复验证环境及预算防线而再消耗一次付费调用。
+- 已在不修改本地脏的上游兼容性 checkout 的前提下拉取官方 `master`，并在提交 [`99f6f02fec`](https://github.com/deepseek-ai/deepseek-harness/commit/99f6f02fec)、`0.1.0-rc.7` 发布系列上完成源码对照。真实 provider 测试构建已在全新公共 registry Host 中安装，显示 A/B 入口，从工作台创建并注册演示 Git 项目，复用官方凭据引用，完成上述对比并渲染逐文件 Diff。加入子运行时 home 隔离和有限准入预算后，最终 tarball 又分别通过真实 JSON-RPC SDK E2E、全部 83 个测试、发布包校验、全新 `rc.7` 安装、Host 启动与 HTTP 200。没有仅为重复验证环境及预算防线而再消耗一次付费调用。
 
 ## 普通用户安装
 
